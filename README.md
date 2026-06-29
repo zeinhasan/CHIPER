@@ -27,7 +27,7 @@ flowchart TD
     G --> I{generate_summary?}
     I -->|no| J[Return Results]
     I -->|yes| K[Background Task<br/>DeepSeek Summary]
-    K --> L[GET /research/{id}<br/>Poll for result]
+    K --> L["GET /research/{id}<br/>Poll for result"]
 ```
 
 ---

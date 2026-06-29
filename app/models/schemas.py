@@ -45,6 +45,16 @@ class ResearchResponse(BaseModel):
     """API response for a research query."""
 
     query: str
+    task_id: str | None = None
     ai_summary: str | None = None
     results: list[ScrapeResult]
     total_results: int
+
+
+class TaskStatusResponse(BaseModel):
+    """API response for polling a background summarization task."""
+
+    task_id: str
+    status: str  # "processing", "done", "error"
+    query: str | None = None
+    ai_summary: str | None = None

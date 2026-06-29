@@ -1,0 +1,13 @@
+# DNS-over-HTTPS proxy config
+# Forwards DNS queries over encrypted HTTPS to Cloudflare & Google
+# This bypasses ISP-level DNS hijacking (Internet Positif)
+
+listen_addresses = ['0.0.0.0:53']
+max_clients = 50
+
+# Use multiple DoH servers for redundancy
+[static]
+  [static.'cloudflare']
+  stamp = 'sdns://AgcAAAAAAAAABzEuMS4xLjEAEmRucy5jbG91ZGZsYXJlLmNvbQovZG5zLXF1ZXJ5'
+  [static.'google']
+  stamp = 'sdns://AgUAAAAAAAAABzguOC44LjigHvYkz_9ea9O63fP92_3qVlRn43cpncfuZnUWbzAMwbkgdoAkR6AZkxo_AEMExT_cbBssN43Evo9zs5_ZyWnftEUKZG5zLmdvb2dsZQovZG5zLXF1ZXJ5'

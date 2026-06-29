@@ -25,3 +25,30 @@ ui:
 
 redis:
   url: false
+
+# Engine Management
+# Disabled: google, brave, startpage, bing, qwant
+# Enabled:  duckduckgo, wikipedia, wikidata
+engines:
+  - name: google
+    disabled: true
+  - name: brave
+    disabled: true
+  - name: startpage
+    disabled: true
+  - name: bing
+    disabled: true
+  - name: qwant
+    disabled: true
+  - name: duckduckgo
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: wikidata
+    disabled: false
+
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 15.0
+  pool_connections: 10
+  pool_maxsize: 10

@@ -4,7 +4,7 @@
 
 > *Headless Asynchronous Knowledge Integrator — v2.5 Deep Fetch + AI Summary Edition*
 
-A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from both static and JavaScript-heavy pages using a Two-Tier strategy, with optional AI summarization via DeepSeek. Comes with full observability: structured JSON logging, request tracing (X-Request-ID), and Prometheus metrics.
+A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. AI summarization runs as a **background task** — the API returns scraped results in <5 seconds while the summary is generated asynchronously. Full observability: JSON logging, X-Request-ID tracing, Prometheus metrics.
 
 ---
 
@@ -12,45 +12,40 @@ A Python/FastAPI middleware API that bridges AI agents with SearXNG for automate
 
 ```
 POST /api/v1/research
-         │
-    ┌────┴─────────────────────────────┐
-    │  Tracing: X-Request-ID           │  ← Unique trace ID per request
-    └────┬─────────────────────────────┘
-         │
-         ▼
-   ┌──────────┐
-   │ SearXNG  │  ← Self-hosted search engine (Docker)
-   └────┬─────┘
-        │ list of result URLs
-        ▼
-   ┌──────────────────────────────────────┐
-   │         Two-Tier Scraping            │
-   │                                      │
-   │  Tier 1: httpx → trafilatura         │  ← Static HTML (fast)
-   │      │                               │
-   │      └── content < 200 chars? ─────┐ │
-   │                                    │ │
-   │  Tier 2: Playwright → trafilatura  │ │  ← Dynamic JS (fallback)
-   │                                    │ │
-   └────────────────────────────────────┘ │
-         │                                │
-         ▼                                │
-   ┌──────────┐                           │
-   │ Markdown │  ← Clean output           │
-   └────┬─────┘                           │
-        │                                 │
-        ▼                                 │
-   ┌──────────┐  (optional)               │
-   │ DeepSeek │  ← AI Summary             │
-   └────┬─────┘                           │
-        │
-        ▼
-   ┌──────────────────────────────────────┐
-   │         Observability                │
-   │                                      │
-   │  JSON Logs  +  X-Request-ID          │  ← All logs structured
-   │  /metrics   +  Prometheus            │  ← Grafana-ready metrics
-   └──────────────────────────────────────┘
+         |
+    +----+-----------------------------+
+    |  Tracing: X-Request-ID           |  <- Unique trace ID
+    +----+-----------------------------+
+         |
+         v
+   +----------+
+   | SearXNG  |  <- Self-hosted search engine (Docker)
+   +----+-----+
+        |
+        v
+   +--------------------------------------+
+   |         Two-Tier Scraping            |
+   |  httpx (static) -> Playwright (SPA)  |
+   |  + retry + backoff + circuit breaker |
+   +----+-----+
+        |
+        v
+   +----------+
+   | Markdown |  <- Clean output
+   +----+-----+
+        |
+        +----- generate_summary = true?
+        |           |
+        |           v
+        |    +----------------+
+        |    | Background Task |  <- AI Summary (async, non-blocking)
+        |    +-------+--------+
+        |            |
+        |            v
+        |    GET /research/{id}  <- Poll for result
+        |
+        +----- return immediately (<5s)
+                    with results + task_id
 ```
 
 ---
@@ -61,12 +56,14 @@ POST /api/v1/research
 |-----------|------------|
 | **Framework** | FastAPI + Uvicorn |
 | **Search Engine** | SearXNG (self-hosted, JSON API) |
-| **Static Fetch** | `httpx` (async) |
+| **Static Fetch** | `httpx` (async, shared connection pool) |
 | **Dynamic Render** | `playwright` (headless Chromium) |
 | **Content Extractor** | `trafilatura` + `markdownify` |
-| **AI Summarization** | `openai` SDK → OpenAI-compatible API → DeepSeek |
-| **Structured Logging** | JSON logs with trace context (`python-json-logger`) |
-| **Metrics** | Prometheus (`prometheus-client` + `prometheus-fastapi-instrumentator`) |
+| **AI Summarization** | `openai` SDK → OpenRouter → DeepSeek |
+| **Reliability** | Retry+backoff, circuit breaker, rate limiting (`slowapi`) |
+| **Background Tasks** | `asyncio.create_task` + in-memory task store |
+| **Structured Logging** | JSON logs with trace context |
+| **Metrics** | Prometheus |
 | **Deployment** | Docker + Docker Compose |
 
 ---
@@ -76,26 +73,28 @@ POST /api/v1/research
 ```
 CHIPER/
 ├── app/
-│   ├── main.py                  # FastAPI entry point + Playwright lifespan
+│   ├── main.py                  # FastAPI entry + lifespan (httpx pool, Playwright, circuit)
 │   ├── config.py                # Environment-based settings
 │   ├── middleware/
 │   │   └── tracing.py           # X-Request-ID middleware
 │   ├── models/
 │   │   └── schemas.py           # Pydantic request/response validation
 │   ├── api/
-│   │   └── routes.py            # POST /api/v1/research endpoint
+│   │   └── routes.py            # POST /research + GET /research/{task_id}
 │   ├── services/
 │   │   ├── searxng.py           # SearXNG JSON API integration
-│   │   ├── scraper.py           # Two-Tier scraping engine
+│   │   ├── scraper.py           # Two-Tier scraping + JS garbage detection
 │   │   └── summarizer.py        # AI summarization (DeepSeek)
 │   └── utils/
 │       ├── helpers.py           # Re-export logging utilities
 │       ├── logging.py           # Structured JSON logging + trace context
-│       └── metrics.py           # Prometheus metrics definitions
+│       ├── metrics.py           # Prometheus metrics definitions
+│       ├── circuit_breaker.py   # 3-state circuit breaker
+│       └── task_store.py        # In-memory background task store
 ├── searxng/
 │   └── settings.yml             # SearXNG configuration
 ├── Dockerfile                   # CHIPER image build
-├── docker-compose.yml           # All-in-one: SearXNG + CHIPER
+├── docker-compose.yml           # All-in-one: DoH proxy + SearXNG + CHIPER
 ├── requirements.txt             # Python dependencies
 ├── IMPROVEMENT.md               # Improvement roadmap
 ├── .env.example                 # Environment variables template
@@ -107,48 +106,17 @@ CHIPER/
 ## 🚀 Quick Start (Docker — Recommended)
 
 ```bash
-# 1. Clone repository
 git clone <repo-url> && cd CHIPER
-
-# 2. Create .env from template and fill in your API key
-cp .env.example .env
-# Edit .env → set CMD_API_KEY=... and CMD_BASE_URL=...
-
-# 3. Run all services (SearXNG + CHIPER)
+cp .env.example .env    # fill in CMD_API_KEY and CMD_BASE_URL
 docker compose up -d --build
 ```
 
 Once running:
 - **CHIPER API**: http://localhost:8000
 - **SearXNG**: http://localhost:8081
-- **Health Check**: http://localhost:8000/health
 - **Swagger Docs**: http://localhost:8000/docs
-- **Prometheus Metrics**: http://localhost:8000/metrics
-
----
-
-## 🖥️ Quick Start (Manual / Development)
-
-```bash
-# 1. Install dependencies
-pip install -r requirements.txt
-
-# 2. Install Playwright browser
-playwright install chromium
-
-# 3. Run SearXNG via Docker
-docker run -d --name searxng -p 8081:8080 \
-  -v ./searxng:/etc/searxng \
-  -e SEARXNG_BASE_URL=http://localhost:8081/ \
-  searxng/searxng:latest
-
-# 4. Setup environment
-cp .env.example .env
-# Edit .env → set CMD_API_KEY=... and CMD_BASE_URL=...
-
-# 5. Run the server
-python -m app.main
-```
+- **Health**: http://localhost:8000/health
+- **Metrics**: http://localhost:8000/metrics
 
 ---
 
@@ -156,7 +124,7 @@ python -m app.main
 
 ### `POST /api/v1/research`
 
-Executes the full research pipeline: SearXNG → Scraping → (optional) AI Summary.
+Executes the research pipeline. Scraping runs synchronously; AI summarization runs as a background task (non-blocking).
 
 #### Request
 
@@ -173,37 +141,65 @@ Executes the full research pipeline: SearXNG → Scraping → (optional) AI Summ
 |-------|------|---------|-------------|
 | `query` | string | — | Search query *(required)* |
 | `max_results` | int | `5` | Maximum URLs to scrape (1–20) |
-| `force_js_render` | bool | `false` | Skip Tier-1 (httpx), go straight to Playwright |
-| `generate_summary` | bool | `false` | Generate AI summary via DeepSeek |
+| `force_js_render` | bool | `false` | Skip Tier-1 for all URLs |
+| `generate_summary` | bool | `false` | Generate AI summary (background task) |
 
-#### Response (`generate_summary: true`)
+#### Response — Without Summary
 
 ```json
 {
-  "query": "Latest financial reports from tech companies",
-  "ai_summary": "Based on the three extracted sources, the majority of tech companies reported...",
-  "results": [
-    {
-      "url": "https://example.com/report",
-      "title": "Q1 2025 Financial Report",
-      "fetch_method": "playwright",
-      "markdown_content": "# Quarterly Report...\n\nData shows...",
-      "content_length": 1542
-    }
-  ],
-  "total_results": 3
+  "query": "DSSA Anjlok",
+  "task_id": null,
+  "ai_summary": null,
+  "results": [{ "url": "...", "title": "...", "fetch_method": "httpx", "markdown_content": "...", "content_length": 3116 }],
+  "total_results": 5
+}
+```
+
+#### Response — With Summary (Background Task)
+
+```json
+{
+  "query": "DSSA Anjlok",
+  "task_id": "a1b2c3d4-...",
+  "ai_summary": null,
+  "results": [{ "url": "...", "title": "...", "fetch_method": "httpx", "markdown_content": "...", "content_length": 3116 }],
+  "total_results": 5
 }
 ```
 
 | Field | Description |
 |-------|-------------|
 | `query` | Original search query |
-| `ai_summary` | AI-generated summary (null if `generate_summary: false`) |
+| `task_id` | Background task ID (null if `generate_summary: false`) |
+| `ai_summary` | AI summary (always null in initial response — poll to get it) |
 | `results[].url` | Scraped URL |
-| `results[].title` | Title from SearXNG result |
+| `results[].title` | Title from SearXNG |
 | `results[].fetch_method` | `httpx` or `playwright` |
-| `results[].markdown_content` | Clean extracted Markdown content |
-| `total_results` | Total number of scraped results |
+| `results[].markdown_content` | Clean extracted Markdown |
+| `total_results` | Total scraped results |
+
+### `GET /api/v1/research/{task_id}`
+
+Poll for the result of a background summarization task.
+
+#### Response — Still Processing
+
+```json
+{ "task_id": "abc-123", "status": "processing", "query": null, "ai_summary": null }
+```
+
+#### Response — Done
+
+```json
+{ "task_id": "abc-123", "status": "done", "query": null, "ai_summary": "Based on the five sources..." }
+```
+
+#### Response — Error
+
+```json
+{ "task_id": "abc-123", "status": "error", "query": null, "ai_summary": "Summarization failed: ..." }
+```
 
 ### `GET /health`
 
@@ -213,19 +209,7 @@ Executes the full research pipeline: SearXNG → Scraping → (optional) AI Summ
 
 ### `GET /metrics`
 
-Exposes Prometheus metrics (OpenMetrics format), including:
-
-| Metric | Description |
-|--------|-------------|
-| `chiper_http_requests_total` | Total HTTP requests (by method, status) |
-| `chiper_searxng_duration_seconds` | SearXNG API call latency |
-| `chiper_searxng_requests_total` | Total SearXNG requests (success/error) |
-| `chiper_searxng_results_total` | Total search results returned |
-| `chiper_scrape_duration_seconds` | Scraping latency per URL (by fetch_method) |
-| `chiper_scrape_total` | Total scrape attempts (by fetch_method, status) |
-| `chiper_tier_fallback_total` | Total Tier-1 → Tier-2 fallbacks |
-| `chiper_summarize_duration_seconds` | AI summarization latency |
-| `chiper_summarize_total` | Total summarization attempts (success/error) |
+Exposes Prometheus metrics (OpenMetrics format).
 
 ---
 
@@ -235,14 +219,20 @@ Exposes Prometheus metrics (OpenMetrics format), including:
 |----------|---------|-------------|
 | `SEARXNG_BASE_URL` | `http://localhost:8080` | SearXNG instance URL |
 | `CMD_API_KEY` | — | API key for AI summarization *(required)* |
-| `CMD_BASE_URL` | `http://localhost:20128/v1` | OpenAI-compatible API base URL |
-| `CMD_MODEL` | `cmc/deepseek/deepseek-v4-pro` | Model name for summarization |
+| `CMD_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible API base URL |
+| `CMD_MODEL` | `deepseek/deepseek-chat` | Model name for summarization |
 | `PLAYWRIGHT_BROWSER_PATH` | *(auto)* | Custom Chromium binary path |
 | `HOST` | `0.0.0.0` | Server host binding |
 | `PORT` | `8000` | Server port |
-| `LOG_FORMAT` | `json` | Log format: `json` (structured) or `console` (human-readable) |
-| `LOG_LEVEL` | `INFO` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `MIN_CONTENT_LENGTH` | `200` | Minimum characters for Tier-1 to be considered sufficient |
+| `LOG_FORMAT` | `json` | `json` (structured) or `console` |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `MIN_CONTENT_LENGTH` | `200` | Min chars for Tier-1 sufficiency |
+| `FETCH_STATIC_RETRIES` | `3` | Max httpx retry attempts |
+| `FETCH_DYNAMIC_RETRIES` | `2` | Max Playwright retry attempts |
+| `FETCH_RETRY_BASE_DELAY` | `1.0` | Base delay for exponential backoff (seconds) |
+| `CIRCUIT_BREAKER_FAILURES` | `5` | Failures before opening SearXNG circuit |
+| `CIRCUIT_BREAKER_TIMEOUT` | `30.0` | Seconds before half-opening circuit |
+| `RATE_LIMIT` | `30/minute` | Max requests per IP |
 
 ---
 
@@ -250,121 +240,79 @@ Exposes Prometheus metrics (OpenMetrics format), including:
 
 ### Structured JSON Logging
 
-Every log entry is machine-parseable JSON, ready for Loki / ELK / Datadog:
-
 ```json
 {
-  "timestamp": "2026-06-29T12:30:00.123456+00:00",
+  "timestamp": "2026-06-29T12:30:00.123+00:00",
   "level": "INFO",
-  "logger": "app.services.scraper",
-  "message": "Tier-1 (httpx) SUCCESS",
-  "module": "scraper",
-  "function": "fetch_and_extract",
-  "line": 142,
-  "trace_id": "a1b2c3d4-5678-90ab-cdef-1234567890ab",
-  "url": "https://example.com/page",
-  "content_length": 1542,
-  "duration_ms": 320
+  "logger": "app.api.routes",
+  "message": "Starting background summarization",
+  "module": "routes",
+  "function": "research",
+  "line": 118,
+  "trace_id": "a1b2c3d4-...",
+  "task_id": "abc-123",
+  "document_count": 5
 }
 ```
 
-Switch to human-readable format:
-```bash
-# in .env
-LOG_FORMAT=console
-```
+Switch format: `LOG_FORMAT=console` in `.env`.
 
 ### Request Tracing
 
-Every request receives a unique `X-Request-ID` (auto-generated or passed from upstream). This ID appears in:
-- All log entries during that request
-- The response header `X-Request-ID`
-
-```bash
-curl -v http://localhost:8000/health
-# < X-Request-ID: a1b2c3d4-5678-90ab-cdef-1234567890ab
-```
+All requests get a unique `X-Request-ID` (auto-generated or passed via header). Appears in all logs and response headers.
 
 ### Prometheus Metrics
 
-The `/metrics` endpoint is Prometheus-scrape ready. **Prometheus is not required** — the endpoint works standalone and can be viewed directly in a browser.
-
-**Optional:** Set up Prometheus + Grafana for visual dashboards:
-```yaml
-# prometheus.yml
-scrape_configs:
-  - job_name: "chiper"
-    scrape_interval: 15s
-    static_configs:
-      - targets: ["chiper:8000"]
-```
+`/metrics` endpoint — scrape-ready. **Prometheus is optional.**
 
 ---
 
 ## 🔄 Two-Tier Scraping Flow
 
 ```
-URL received
-    │
-    ▼
-force_js_render = false?
-    │
-    ├── YES ──► Tier 1: httpx (static fetch)
-    │              │
-    │              ├── HTML obtained & content >= 200 chars ──► DONE
-    │              │
-    │              └── FAILED / content < 200 chars ──► Continue to Tier 2
-    │
-    └── NO ────► Tier 2: Playwright Chromium (headless)
-                       │
-                       ├── Open page, wait for network idle
-                       ├── Block images/CSS/fonts (save bandwidth)
-                       └── Extract full rendered HTML
+URL received → force_js_render?
+    |
+    +-- false → Tier 1: httpx (retry 3x, exponential backoff)
+    |              +-- content >= 200 chars AND not JS garbage → DONE
+    |              +-- otherwise → fallback to Tier 2
+    |
+    +-- true  → Tier 2: Playwright (retry 2x, exponential backoff)
+                   +-- block images/CSS/fonts
+                   +-- wait network idle
+                   +-- extract rendered HTML
 
-HTML from Tier 1 or Tier 2
-    │
-    ▼
-trafilatura → extract main content, strip boilerplate
-    │
-    ▼
-Clean Markdown
+HTML → trafilatura → Clean Markdown
 ```
 
-Concurrency is managed via `asyncio.gather` + `Semaphore` (max 3 simultaneous Playwright contexts).
+Concurrency: `asyncio.gather` + `Semaphore` (max 3 Playwright contexts).
 
 ---
 
 ## 🧪 Example cURL Requests
 
 ```bash
-# Research without AI summary
+# Quick research (no summary, <5s)
 curl -X POST http://localhost:8000/api/v1/research \
   -H "Content-Type: application/json" \
-  -d '{"query": "Python FastAPI best practices", "max_results": 3}'
+  -d '{"query": "DSSA Anjlok", "max_results": 3}'
 
-# Research + AI summary
+# Research + summary (background, <5s return)
 curl -X POST http://localhost:8000/api/v1/research \
   -H "Content-Type: application/json" \
-  -d '{
-    "query": "Latest financial reports from tech companies",
-    "max_results": 5,
-    "generate_summary": true
-  }'
+  -d '{"query": "DSSA Anjlok", "max_results": 5, "generate_summary": true}'
+# → {"task_id": "abc-123", "results": [...], "ai_summary": null}
 
-# Force Playwright for all URLs (skip Tier-1)
+# Poll for summary
+curl http://localhost:8000/api/v1/research/abc-123
+# → {"status": "processing"} ... repeat until "done"
+
+# Force Playwright
 curl -X POST http://localhost:8000/api/v1/research \
   -H "Content-Type: application/json" \
-  -d '{
-    "query": "React 19 new features",
-    "max_results": 3,
-    "force_js_render": true
-  }'
+  -d '{"query": "React 19 features", "max_results": 3, "force_js_render": true}'
 
-# View Prometheus metrics
+# Metrics
 curl http://localhost:8000/metrics
-
-# Check trace ID in response headers
-curl -v http://localhost:8000/health
 ```
 
 ---

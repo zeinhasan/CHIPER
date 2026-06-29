@@ -2,7 +2,7 @@
 SearXNG Integration Service
 
 Communicates with a self-hosted SearXNG instance to retrieve search results.
-Instrumented with Prometheus metrics for observability.
+Protected by a circuit breaker and instrumented with Prometheus metrics.
 """
 
 import time
@@ -16,9 +16,15 @@ from app.utils.metrics import searxng_duration, searxng_requests, searxng_result
 logger = get_logger(__name__)
 
 
-async def search(query: str, max_results: int = 5) -> list[dict]:
+async def search(
+    query: str,
+    client: httpx.AsyncClient,
+    max_results: int = 5,
+) -> list[dict]:
     """
     Query the SearXNG JSON API and return a list of result dicts.
+
+    Uses a shared httpx.AsyncClient for connection pool reuse.
 
     Each result dict contains:
         - url: str
@@ -37,16 +43,15 @@ async def search(query: str, max_results: int = 5) -> list[dict]:
     logger.info("Querying SearXNG", extra={"query": query, "max_results": max_results})
     start = time.monotonic()
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            response = await client.get(searxng_url, params=params)
-            response.raise_for_status()
-            data = response.json()
-            searxng_requests.labels(status="success").inc()
-        except httpx.HTTPError as exc:
-            searxng_requests.labels(status="error").inc()
-            logger.error("SearXNG request failed", extra={"query": query})
-            raise RuntimeError(f"Failed to reach SearXNG: {exc}") from exc
+    try:
+        response = await client.get(searxng_url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        searxng_requests.labels(status="success").inc()
+    except httpx.HTTPError as exc:
+        searxng_requests.labels(status="error").inc()
+        logger.error("SearXNG request failed", extra={"query": query})
+        raise RuntimeError(f"Failed to reach SearXNG: {exc}") from exc
 
     elapsed = time.monotonic() - start
     searxng_duration.observe(elapsed)

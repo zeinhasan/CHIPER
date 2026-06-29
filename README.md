@@ -10,39 +10,24 @@ A Python/FastAPI middleware API that bridges AI agents with SearXNG for automate
 
 ## 🏗️ Architecture
 
-```
-POST /api/v1/research
-         |
-    +----+-----------------------------+
-    |  Tracing: X-Request-ID           |  <- Unique trace ID
-    +----+-----------------------------+
-         |
-         v
-   +----------+
-   | SearXNG  |  <- Self-hosted search engine (Docker)
-   +----+-----+     + circuit breaker
-        |
-        v
-   +--------------------------------------+
-   |         Two-Tier Scraping            |
-   |  httpx (static) -> Playwright (SPA)  |
-   |  + retry+backoff + browser pool      |  <- N Chromium instances (round-robin)
-   +----+-----+
-        |
-        v
-   +----------+
-   | Markdown |  <- Clean output
-   +----+-----+
-        |
-        +----- generate_summary = true?
-                   |
-                   v
-            +----------------+
-            | Background Task |  <- AI Summary (async, non-blocking)
-            +-------+--------+
-                    |
-                    v
-            GET /research/{id}  <- Poll for result
+```mermaid
+flowchart TD
+    A[POST /api/v1/research] --> B[Tracing Middleware<br/>X-Request-ID]
+    B --> C[SearXNG<br/>Search Engine]
+    C -->|circuit breaker| D{Two-Tier<br/>Scraping}
+
+    D -->|Tier 1| E[httpx<br/>Static Fetch]
+    E -->|retry 3x backoff| F{Content OK?}
+    F -->|yes| G[Clean Markdown]
+    F -->|no / JS garbage| H[Tier 2]
+    D -->|force_js_render| H
+
+    H[Playwright<br/>Dynamic Render] -->|retry 2x + browser pool| G
+
+    G --> I{generate_summary?}
+    I -->|no| J[Return Results]
+    I -->|yes| K[Background Task<br/>DeepSeek Summary]
+    K --> L[GET /research/{id}<br/>Poll for result]
 ```
 
 ---
@@ -103,7 +88,7 @@ CHIPER/
 ## 🚀 Quick Start (Docker — Recommended)
 
 ```bash
-git clone <repo-url> && cd CHIPER
+git clone https://github.com/zeinhasan/CHIPER && cd CHIPER
 cp .env.example .env    # fill in CMD_API_KEY and CMD_BASE_URL
 docker compose up -d --build
 ```
@@ -141,18 +126,6 @@ Executes the research pipeline. Scraping runs synchronously; AI summarization ru
 | `force_js_render` | bool | `false` | Skip Tier-1 for all URLs |
 | `generate_summary` | bool | `false` | Generate AI summary (background task) |
 
-#### Response — Without Summary
-
-```json
-{
-  "query": "DSSA Anjlok",
-  "task_id": null,
-  "ai_summary": null,
-  "results": [{ "url": "...", "title": "...", "fetch_method": "httpx", "markdown_content": "...", "content_length": 3116 }],
-  "total_results": 5
-}
-```
-
 #### Response — With Summary (Background Task)
 
 ```json
@@ -160,7 +133,13 @@ Executes the research pipeline. Scraping runs synchronously; AI summarization ru
   "query": "DSSA Anjlok",
   "task_id": "a1b2c3d4-...",
   "ai_summary": null,
-  "results": [{ "url": "...", "title": "...", "fetch_method": "httpx", "markdown_content": "...", "content_length": 3116 }],
+  "results": [{
+    "url": "https://...",
+    "title": "Saham DSSA Anjlok...",
+    "fetch_method": "httpx",
+    "markdown_content": "PT Dian Swastatika...",
+    "content_length": 3116
+  }],
   "total_results": 5
 }
 ```
@@ -169,7 +148,7 @@ Executes the research pipeline. Scraping runs synchronously; AI summarization ru
 |-------|-------------|
 | `query` | Original search query |
 | `task_id` | Background task ID (null if `generate_summary: false`) |
-| `ai_summary` | AI summary (always null in initial response — poll to get it) |
+| `ai_summary` | AI summary (null in initial response — poll to get it) |
 | `results[].url` | Scraped URL |
 | `results[].title` | Title from SearXNG |
 | `results[].fetch_method` | `httpx` or `playwright` |
@@ -216,7 +195,7 @@ Exposes Prometheus metrics (OpenMetrics format).
 | `MIN_CONTENT_LENGTH` | `200` | Min chars for Tier-1 sufficiency |
 | `FETCH_STATIC_RETRIES` | `3` | Max httpx retry attempts |
 | `FETCH_DYNAMIC_RETRIES` | `2` | Max Playwright retry attempts |
-| `FETCH_RETRY_BASE_DELAY` | `1.0` | Base delay for exponential backoff (seconds) |
+| `FETCH_RETRY_BASE_DELAY` | `1.0` | Base delay for exponential backoff |
 | `CIRCUIT_BREAKER_FAILURES` | `5` | Failures before opening SearXNG circuit |
 | `CIRCUIT_BREAKER_TIMEOUT` | `30.0` | Seconds before half-opening circuit |
 | `RATE_LIMIT` | `30/minute` | Max requests per IP |
@@ -240,8 +219,6 @@ URL received → force_js_render?
 
 HTML → trafilatura → Clean Markdown
 ```
-
-Concurrency: `asyncio.gather` + `Semaphore` (max 3 Playwright contexts). URLs distributed across browser pool via `itertools.cycle`.
 
 ---
 

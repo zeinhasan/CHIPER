@@ -1,0 +1,19 @@
+# FastAPI & Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# HTTP Client & Scraping
+httpx>=0.27.0
+trafilatura>=1.12.0
+markdownify>=0.13.0
+
+# Dynamic Rendering (JavaScript-heavy sites)
+playwright>=1.45.0
+
+# AI Summarization (OpenAI-compatible SDK)
+openai>=1.35.0
+
+# Observability
+python-json-logger>=3.0.0
+prometheus-client>=0.20.0
+prometheus-fastapi-instrumentator>=7.0.0

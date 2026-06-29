@@ -1,0 +1,27 @@
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "CHIPER SearXNG"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: ""
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "chiper-searxng-secret-change-in-production"
+  bind_address: "0.0.0.0"
+  port: 8080
+  base_url: http://localhost:8081/
+  limiter: false
+  image_proxy: false
+
+ui:
+  static_use_hash: true
+
+redis:
+  url: false

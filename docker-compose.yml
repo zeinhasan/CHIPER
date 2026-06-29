@@ -1,0 +1,52 @@
+# ============================================================
+# CHIPER + SearXNG — All-in-One Docker Compose
+# ============================================================
+#
+# Usage:
+#   docker compose up -d --build
+#
+# Services:
+#   - searxng  → SearXNG search engine (port 8081)
+#   - chiper   → CHIPER API middleware (port 8000)
+# ============================================================
+
+services:
+  # ── SearXNG Search Engine ──────────────────────────────────────
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    networks:
+      - chiper-net
+
+  # ── CHIPER API Middleware ──────────────────────────────────────
+  chiper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chiper
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - searxng
+    networks:
+      - chiper-net
+
+networks:
+  chiper-net:
+    driver: bridge

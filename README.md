@@ -4,7 +4,7 @@
 
 > *Headless Asynchronous Knowledge Integrator — v2.5 Deep Fetch + AI Summary Edition*
 
-A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. AI summarization runs as a **background task** — the API returns scraped results in <5 seconds while the summary is generated asynchronously. Full observability: JSON logging, X-Request-ID tracing, Prometheus metrics.
+A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. AI summarization runs as a **background task** — the API returns scraped results in <5 seconds. Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, and browser pool.
 
 ---
 
@@ -20,13 +20,13 @@ POST /api/v1/research
          v
    +----------+
    | SearXNG  |  <- Self-hosted search engine (Docker)
-   +----+-----+
+   +----+-----+     + circuit breaker
         |
         v
    +--------------------------------------+
    |         Two-Tier Scraping            |
    |  httpx (static) -> Playwright (SPA)  |
-   |  + retry + backoff + circuit breaker |
+   |  + retry+backoff + browser pool      |  <- N Chromium instances (round-robin)
    +----+-----+
         |
         v
@@ -35,17 +35,14 @@ POST /api/v1/research
    +----+-----+
         |
         +----- generate_summary = true?
-        |           |
-        |           v
-        |    +----------------+
-        |    | Background Task |  <- AI Summary (async, non-blocking)
-        |    +-------+--------+
-        |            |
-        |            v
-        |    GET /research/{id}  <- Poll for result
-        |
-        +----- return immediately (<5s)
-                    with results + task_id
+                   |
+                   v
+            +----------------+
+            | Background Task |  <- AI Summary (async, non-blocking)
+            +-------+--------+
+                    |
+                    v
+            GET /research/{id}  <- Poll for result
 ```
 
 ---
@@ -57,10 +54,10 @@ POST /api/v1/research
 | **Framework** | FastAPI + Uvicorn |
 | **Search Engine** | SearXNG (self-hosted, JSON API) |
 | **Static Fetch** | `httpx` (async, shared connection pool) |
-| **Dynamic Render** | `playwright` (headless Chromium) |
+| **Dynamic Render** | `playwright` (headless Chromium, browser pool) |
 | **Content Extractor** | `trafilatura` + `markdownify` |
 | **AI Summarization** | `openai` SDK → OpenRouter → DeepSeek |
-| **Reliability** | Retry+backoff, circuit breaker, rate limiting (`slowapi`) |
+| **Reliability** | Retry+backoff, circuit breaker, rate limiting (`slowapi`), browser pool |
 | **Background Tasks** | `asyncio.create_task` + in-memory task store |
 | **Structured Logging** | JSON logs with trace context |
 | **Metrics** | Prometheus |
@@ -73,7 +70,7 @@ POST /api/v1/research
 ```
 CHIPER/
 ├── app/
-│   ├── main.py                  # FastAPI entry + lifespan (httpx pool, Playwright, circuit)
+│   ├── main.py                  # FastAPI entry + lifespan (httpx pool, browser pool, circuit)
 │   ├── config.py                # Environment-based settings
 │   ├── middleware/
 │   │   └── tracing.py           # X-Request-ID middleware
@@ -83,7 +80,7 @@ CHIPER/
 │   │   └── routes.py            # POST /research + GET /research/{task_id}
 │   ├── services/
 │   │   ├── searxng.py           # SearXNG JSON API integration
-│   │   ├── scraper.py           # Two-Tier scraping + JS garbage detection
+│   │   ├── scraper.py           # Two-Tier scraping + JS garbage detection + browser pool
 │   │   └── summarizer.py        # AI summarization (DeepSeek)
 │   └── utils/
 │       ├── helpers.py           # Re-export logging utilities
@@ -183,23 +180,12 @@ Executes the research pipeline. Scraping runs synchronously; AI summarization ru
 
 Poll for the result of a background summarization task.
 
-#### Response — Still Processing
-
-```json
-{ "task_id": "abc-123", "status": "processing", "query": null, "ai_summary": null }
-```
-
-#### Response — Done
-
-```json
-{ "task_id": "abc-123", "status": "done", "query": null, "ai_summary": "Based on the five sources..." }
-```
-
-#### Response — Error
-
-```json
-{ "task_id": "abc-123", "status": "error", "query": null, "ai_summary": "Summarization failed: ..." }
-```
+| `status` | Meaning |
+|----------|---------|
+| `processing` | Summary is still being generated |
+| `done` | Summary is ready |
+| `error` | Summarization failed |
+| `not_found` | Task ID not found or expired |
 
 ### `GET /health`
 
@@ -222,6 +208,7 @@ Exposes Prometheus metrics (OpenMetrics format).
 | `CMD_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible API base URL |
 | `CMD_MODEL` | `deepseek/deepseek-chat` | Model name for summarization |
 | `PLAYWRIGHT_BROWSER_PATH` | *(auto)* | Custom Chromium binary path |
+| `BROWSER_POOL_SIZE` | `2` | Number of Chromium instances (round-robin) |
 | `HOST` | `0.0.0.0` | Server host binding |
 | `PORT` | `8000` | Server port |
 | `LOG_FORMAT` | `json` | `json` (structured) or `console` |
@@ -236,37 +223,6 @@ Exposes Prometheus metrics (OpenMetrics format).
 
 ---
 
-## 🔍 Observability
-
-### Structured JSON Logging
-
-```json
-{
-  "timestamp": "2026-06-29T12:30:00.123+00:00",
-  "level": "INFO",
-  "logger": "app.api.routes",
-  "message": "Starting background summarization",
-  "module": "routes",
-  "function": "research",
-  "line": 118,
-  "trace_id": "a1b2c3d4-...",
-  "task_id": "abc-123",
-  "document_count": 5
-}
-```
-
-Switch format: `LOG_FORMAT=console` in `.env`.
-
-### Request Tracing
-
-All requests get a unique `X-Request-ID` (auto-generated or passed via header). Appears in all logs and response headers.
-
-### Prometheus Metrics
-
-`/metrics` endpoint — scrape-ready. **Prometheus is optional.**
-
----
-
 ## 🔄 Two-Tier Scraping Flow
 
 ```
@@ -277,6 +233,7 @@ URL received → force_js_render?
     |              +-- otherwise → fallback to Tier 2
     |
     +-- true  → Tier 2: Playwright (retry 2x, exponential backoff)
+                   +-- browser pool: N instances, round-robin
                    +-- block images/CSS/fonts
                    +-- wait network idle
                    +-- extract rendered HTML
@@ -284,7 +241,7 @@ URL received → force_js_render?
 HTML → trafilatura → Clean Markdown
 ```
 
-Concurrency: `asyncio.gather` + `Semaphore` (max 3 Playwright contexts).
+Concurrency: `asyncio.gather` + `Semaphore` (max 3 Playwright contexts). URLs distributed across browser pool via `itertools.cycle`.
 
 ---
 
@@ -300,19 +257,14 @@ curl -X POST http://localhost:8000/api/v1/research \
 curl -X POST http://localhost:8000/api/v1/research \
   -H "Content-Type: application/json" \
   -d '{"query": "DSSA Anjlok", "max_results": 5, "generate_summary": true}'
-# → {"task_id": "abc-123", "results": [...], "ai_summary": null}
 
 # Poll for summary
 curl http://localhost:8000/api/v1/research/abc-123
-# → {"status": "processing"} ... repeat until "done"
 
 # Force Playwright
 curl -X POST http://localhost:8000/api/v1/research \
   -H "Content-Type: application/json" \
   -d '{"query": "React 19 features", "max_results": 3, "force_js_render": true}'
-
-# Metrics
-curl http://localhost:8000/metrics
 ```
 
 ---

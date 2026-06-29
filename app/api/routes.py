@@ -4,6 +4,7 @@ API Route Handlers
 Defines /api/v1/research and /api/v1/research/{task_id} endpoints.
 Protected by circuit breaker (SearXNG) and rate limiting (slowapi).
 Uses background tasks for AI summarization to keep response fast.
+Distributes scraping across browser pool (round-robin).
 Instrumented with Prometheus metrics for observability.
 """
 
@@ -53,7 +54,7 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
 
     # Shared resources from app state
     http_client = request.app.state.http_client
-    browser = request.app.state.playwright_browser
+    browsers = request.app.state.playwright_browsers
     searxng_circuit = request.app.state.searxng_circuit
 
     # ── Step 1: SearXNG (with circuit breaker) ────────────────────
@@ -95,10 +96,10 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
         extra={"query": payload.query, "url_count": len(urls)},
     )
 
-    # ── Step 2: Two-Tier Scraping (synchronous) ────────────────────
+    # ── Step 2: Two-Tier Scraping (browser pool, round-robin) ─────
     scrape_results = await scraper.scrape_urls(
         urls=urls,
-        browser=browser,
+        browsers=browsers,
         client=http_client,
         force_js_render=payload.force_js_render,
         max_concurrent_playwright=3,
@@ -131,10 +132,8 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
                 extra={"task_id": task_id, "document_count": len(documents)},
             )
 
-            # Fire-and-forget: summarization runs in background
             asyncio.create_task(_run_summarization(task_id, documents, payload.query))
 
-            # Return immediately with scraped results + task_id
             return ResearchResponse(
                 query=payload.query,
                 task_id=task_id,

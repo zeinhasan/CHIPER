@@ -1,6 +1,13 @@
 """
 CHIPER — Content Integration, Parsing, and HTML Extraction Routine
 FastAPI Application Entry Point
+
+Features:
+- Shared httpx connection pool
+- Browser pool (multiple Chromium instances, round-robin)
+- Circuit breaker for SearXNG
+- Rate limiting via slowapi
+- Prometheus metrics + structured JSON logging
 """
 
 from contextlib import asynccontextmanager
@@ -26,13 +33,8 @@ async def lifespan(app: FastAPI):
     """
     FastAPI lifespan context manager.
 
-    On startup:
-        - Configure structured JSON logging.
-        - Create shared httpx.AsyncClient (connection pool reuse).
-        - Launch Playwright (shared Chromium instance).
-        - Initialize circuit breaker for SearXNG.
-    On shutdown:
-        - Gracefully close browser, HTTP client, and Playwright.
+    On startup: logging, httpx pool, browser pool, circuit breaker.
+    On shutdown: gracefully close all resources.
     """
 
     # --- Startup ---
@@ -58,24 +60,33 @@ async def lifespan(app: FastAPI):
         settings.circuit_breaker_timeout,
     )
 
-    # Playwright
-    logger.info("Starting Playwright...")
+    # Browser Pool: launch N Chromium instances for round-robin load distribution
+    logger.info(
+        "Starting Playwright + Browser Pool (size=%d)...", settings.browser_pool_size
+    )
     pw = await async_playwright().start()
 
     launch_kwargs: dict = {"headless": True}
     if settings.playwright_browser_path:
         launch_kwargs["executable_path"] = settings.playwright_browser_path
 
-    browser: Browser = await pw.chromium.launch(**launch_kwargs)
+    browsers: list[Browser] = []
+    for i in range(settings.browser_pool_size):
+        browser = await pw.chromium.launch(**launch_kwargs)
+        browsers.append(browser)
+        logger.info("Browser #%d/%d launched.", i + 1, settings.browser_pool_size)
+
     app.state.playwright = pw
-    app.state.playwright_browser = browser
-    logger.info("Playwright Chromium browser launched (headless).")
+    app.state.playwright_browsers = browsers
+    logger.info("Browser pool ready: %d instances.", len(browsers))
 
     yield  # Application runs here
 
     # --- Shutdown ---
-    logger.info("Shutting down Playwright browser...")
-    await browser.close()
+    logger.info("Shutting down browser pool (%d instances)...", len(browsers))
+    for i, browser in enumerate(browsers):
+        await browser.close()
+        logger.info("Browser #%d closed.", i + 1)
     await pw.stop()
     logger.info("Playwright stopped.")
 

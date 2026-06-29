@@ -20,6 +20,7 @@ class Settings:
 
     # --- Playwright ---
     playwright_browser_path: str | None = os.getenv("PLAYWRIGHT_BROWSER_PATH") or None
+    browser_pool_size: int = int(os.getenv("BROWSER_POOL_SIZE", "2"))
 
     # --- Server ---
     host: str = os.getenv("HOST", "0.0.0.0")

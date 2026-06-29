@@ -1,19 +1,20 @@
 """
 Two-Tier Scraping Engine
 
-Tier 1 (Fast Path - Static): httpx → trafilatura
-Tier 2 (Deep Path - Dynamic): Playwright headless browser → trafilatura
+Tier 1 (Fast Path - Static): httpx -> trafilatura
+Tier 2 (Deep Path - Dynamic): Playwright headless browser -> trafilatura
 
 Falls back from Tier 1 to Tier 2 when:
   - Tier 1 returns insufficient content (< min_content_length chars)
   - Tier 1 content is detected as JavaScript garbage (SPA without JS rendering)
   - force_js_render flag is explicitly set
 
-Features retry with exponential backoff for resilient fetching.
+Features retry + exponential backoff, and browser pool for round-robin load distribution.
 Instrumented with Prometheus metrics for observability.
 """
 
 import asyncio
+import itertools
 import re
 import time
 
@@ -73,28 +74,21 @@ _JS_DENSITY_THRESHOLD: float = 10.0
 
 
 def _is_javascript_garbage(content: str) -> bool:
-    """
-    Detect if extracted content is mostly JavaScript code rather than
-    human-readable article text (e.g. from a JS-heavy SPA fetched statically).
-    """
+    """Detect if content is mostly JavaScript code rather than article text."""
     if not content or len(content) < 200:
         return False
 
     text = content.lower()
-
-    # Count JavaScript-indicative patterns
     js_hits = 0
     for pattern in _JS_PATTERNS:
         js_hits += len(re.findall(pattern, text))
 
-    # Calculate density: JS patterns per 1000 characters
     kb = len(content) / 1000.0
     density = js_hits / kb if kb > 0 else 0
 
     if density > _JS_DENSITY_THRESHOLD:
         return True
 
-    # Heuristic: lots of semicolons + no paragraph breaks = code
     semicolons = text.count(";")
     newlines = text.count("\n")
     if newlines < 5 and semicolons > 50:
@@ -104,15 +98,9 @@ def _is_javascript_garbage(content: str) -> bool:
 
 
 def _extract_markdown(html: str) -> str:
-    """
-    Extract clean, readable content from raw HTML.
-
-    Uses trafilatura as the primary extractor. Falls back to markdownify
-    if trafilatura returns nothing (e.g. very small pages).
-    """
+    """Extract clean, readable content from raw HTML."""
     raw_html = html or ""
 
-    # Primary: trafilatura (removes boilerplate, nav, ads, etc.)
     extracted = trafilatura.extract(
         raw_html,
         output_format="markdown",
@@ -123,7 +111,6 @@ def _extract_markdown(html: str) -> str:
     if extracted and len(extracted.strip()) >= 50:
         return extracted.strip()
 
-    # Fallback: markdownify (best-effort HTML → Markdown conversion)
     logger.debug(
         "trafilatura returned short/empty output; falling back to markdownify."
     )
@@ -139,14 +126,7 @@ async def _fetch_static(
     url: str,
     client: httpx.AsyncClient,
 ) -> tuple[str | None, str | None]:
-    """
-    Tier 1: Fetch URL with httpx (static HTML, no JavaScript).
-
-    Retries up to STATIC_RETRIES times with exponential backoff.
-
-    Returns:
-        (html, error_message) — exactly one will be None.
-    """
+    """Tier 1: static fetch with retry + backoff."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -165,7 +145,6 @@ async def _fetch_static(
             resp.raise_for_status()
             return resp.text, None
         except httpx.HTTPStatusError as exc:
-            # Don't retry client errors (4xx)
             if 400 <= exc.response.status_code < 500:
                 return None, f"HTTP {exc.response.status_code}"
             last_error = f"HTTP {exc.response.status_code}"
@@ -191,15 +170,7 @@ async def _fetch_dynamic(
     url: str,
     browser: Browser,
 ) -> tuple[str | None, str | None]:
-    """
-    Tier 2: Fetch URL with Playwright headless Chromium (JavaScript-rendered).
-
-    Retries up to DYNAMIC_RETRIES times with exponential backoff.
-    Blocks images/CSS/fonts to speed up rendering.
-
-    Returns:
-        (html, error_message) — exactly one will be None.
-    """
+    """Tier 2: Playwright fetch with retry + backoff."""
     last_error = None
 
     for attempt in range(1, DYNAMIC_RETRIES + 1):
@@ -216,9 +187,7 @@ async def _fetch_dynamic(
         page = await context.new_page()
 
         try:
-            logger.debug("Playwright navigating", extra={"url": url})
             await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-
             try:
                 await page.wait_for_load_state("networkidle", timeout=10_000)
             except Exception:
@@ -252,7 +221,7 @@ async def _fetch_dynamic(
 
 
 async def _block_unnecessary(route):
-    """Route handler that blocks images, media, fonts, and stylesheets."""
+    """Block images, media, fonts, and stylesheets."""
     if route.request.resource_type in BLOCKED_RESOURCES:
         await route.abort()
     else:
@@ -270,14 +239,9 @@ async def fetch_and_extract(
     """
     Scrape a single URL using the Two-Tier strategy.
 
-    1. Tier 1: Try static fetch with httpx (with retry + backoff).
-    2. If content is too short, is JS garbage, or force_js_render=True,
-       escalate to Tier 2 (Playwright, with retry + backoff).
-    3. Extract Markdown from the final HTML.
-
     Args:
         url: Target URL to scrape.
-        browser: Playwright Browser instance (shared across requests).
+        browser: Playwright Browser instance (from the pool).
         client: Shared httpx.AsyncClient (connection pool reuse).
         force_js_render: If True, skip Tier 1 entirely.
         semaphore: Optional semaphore to limit concurrent Playwright instances.
@@ -304,7 +268,6 @@ async def fetch_and_extract(
             markdown = _extract_markdown(html)
             content_len = len(markdown)
 
-            # ── Quality gate ────────────────────────────────────────
             if content_len >= MIN_CONTENT_LENGTH and not _is_javascript_garbage(
                 markdown
             ):
@@ -396,7 +359,7 @@ async def fetch_and_extract(
 
 async def scrape_urls(
     urls: list[str],
-    browser: Browser,
+    browsers: list[Browser],
     client: httpx.AsyncClient,
     *,
     force_js_render: bool = False,
@@ -405,15 +368,14 @@ async def scrape_urls(
     """
     Scrape multiple URLs concurrently using the Two-Tier strategy.
 
-    Uses asyncio.gather for parallelism. A semaphore limits the number
-    of simultaneous Playwright instances to avoid overwhelming the browser.
+    Distributes URLs across browser pool via round-robin.
 
     Args:
         urls: List of URLs to scrape.
-        browser: Shared Playwright Browser instance.
-        client: Shared httpx.AsyncClient (connection pool reuse).
+        browsers: Browser pool (round-robin distributed).
+        client: Shared httpx.AsyncClient.
         force_js_render: If True, skip Tier-1 for all URLs.
-        max_concurrent_playwright: Max concurrent Playwright browser contexts.
+        max_concurrent_playwright: Max concurrent Playwright contexts.
 
     Returns:
         List of result dicts (one per URL).
@@ -422,11 +384,12 @@ async def scrape_urls(
         return []
 
     semaphore = asyncio.Semaphore(max_concurrent_playwright)
+    pool = itertools.cycle(browsers)
 
     tasks = [
         fetch_and_extract(
             url,
-            browser,
+            next(pool),
             client,
             force_js_render=force_js_render,
             semaphore=semaphore,
@@ -436,7 +399,11 @@ async def scrape_urls(
 
     logger.info(
         "Scraping URLs concurrently",
-        extra={"url_count": len(urls), "force_js": force_js_render},
+        extra={
+            "url_count": len(urls),
+            "force_js": force_js_render,
+            "browser_pool_size": len(browsers),
+        },
     )
     results = await asyncio.gather(*tasks)
     return list(results)

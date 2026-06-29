@@ -4,31 +4,31 @@
 
 > *Headless Asynchronous Knowledge Integrator — v2.5 Deep Fetch + AI Summary Edition*
 
-Middleware API berbasis Python/FastAPI yang menjembatani AI Agent dengan SearXNG untuk riset web otomatis. Mengekstrak konten dari halaman statis maupun dinamis (JavaScript-heavy), lalu secara opsional merangkum semua hasil menggunakan DeepSeek AI. Dilengkapi **observability** penuh: structured JSON logging, request tracing (X-Request-ID), dan Prometheus metrics.
+A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from both static and JavaScript-heavy pages using a Two-Tier strategy, with optional AI summarization via DeepSeek. Comes with full observability: structured JSON logging, request tracing (X-Request-ID), and Prometheus metrics.
 
 ---
 
-## 🏗️ Arsitektur
+## 🏗️ Architecture
 
 ```
 POST /api/v1/research
          │
     ┌────┴─────────────────────────────┐
-    │  Tracing: X-Request-ID           │  ← Setiap request punya trace ID
+    │  Tracing: X-Request-ID           │  ← Unique trace ID per request
     └────┬─────────────────────────────┘
          │
          ▼
    ┌──────────┐
    │ SearXNG  │  ← Self-hosted search engine (Docker)
    └────┬─────┘
-        │ daftar URL hasil pencarian
+        │ list of result URLs
         ▼
    ┌──────────────────────────────────────┐
    │         Two-Tier Scraping            │
    │                                      │
-   │  Tier 1: httpx → trafilatura         │  ← Static HTML (cepat)
+   │  Tier 1: httpx → trafilatura         │  ← Static HTML (fast)
    │      │                               │
-   │      └── konten < 200 chars? ──────┐ │
+   │      └── content < 200 chars? ─────┐ │
    │                                    │ │
    │  Tier 2: Playwright → trafilatura  │ │  ← Dynamic JS (fallback)
    │                                    │ │
@@ -36,11 +36,11 @@ POST /api/v1/research
          │                                │
          ▼                                │
    ┌──────────┐                           │
-   │ Markdown │  ← Hasil bersih           │
+   │ Markdown │  ← Clean output           │
    └────┬─────┘                           │
         │                                 │
         ▼                                 │
-   ┌──────────┐  (opsional)               │
+   ┌──────────┐  (optional)               │
    │ DeepSeek │  ← AI Summary             │
    └────┬─────┘                           │
         │
@@ -48,8 +48,8 @@ POST /api/v1/research
    ┌──────────────────────────────────────┐
    │         Observability                │
    │                                      │
-   │  JSON Logs  +  X-Request-ID          │  ← Semua log terstruktur
-   │  /metrics   +  Prometheus            │  ← Metrik siap Grafana
+   │  JSON Logs  +  X-Request-ID          │  ← All logs structured
+   │  /metrics   +  Prometheus            │  ← Grafana-ready metrics
    └──────────────────────────────────────┘
 ```
 
@@ -57,27 +57,27 @@ POST /api/v1/research
 
 ## 🛠️ Tech Stack
 
-| Komponen | Teknologi |
-|----------|-----------|
+| Component | Technology |
+|-----------|------------|
 | **Framework** | FastAPI + Uvicorn |
 | **Search Engine** | SearXNG (self-hosted, JSON API) |
 | **Static Fetch** | `httpx` (async) |
 | **Dynamic Render** | `playwright` (headless Chromium) |
 | **Content Extractor** | `trafilatura` + `markdownify` |
 | **AI Summarization** | `openai` SDK → OpenAI-compatible API → DeepSeek |
-| **Structured Logging** | JSON logs dengan trace context (`python-json-logger`) |
+| **Structured Logging** | JSON logs with trace context (`python-json-logger`) |
 | **Metrics** | Prometheus (`prometheus-client` + `prometheus-fastapi-instrumentator`) |
 | **Deployment** | Docker + Docker Compose |
 
 ---
 
-## 📁 Struktur Project
+## 📁 Project Structure
 
 ```
 CHIPER/
 ├── app/
 │   ├── main.py                  # FastAPI entry point + Playwright lifespan
-│   ├── config.py                # Settings dari environment variables
+│   ├── config.py                # Environment-based settings
 │   ├── middleware/
 │   │   └── tracing.py           # X-Request-ID middleware
 │   ├── models/
@@ -85,7 +85,7 @@ CHIPER/
 │   ├── api/
 │   │   └── routes.py            # POST /api/v1/research endpoint
 │   ├── services/
-│   │   ├── searxng.py           # Integrasi SearXNG JSON API
+│   │   ├── searxng.py           # SearXNG JSON API integration
 │   │   ├── scraper.py           # Two-Tier scraping engine
 │   │   └── summarizer.py        # AI summarization (DeepSeek)
 │   └── utils/
@@ -93,32 +93,32 @@ CHIPER/
 │       ├── logging.py           # Structured JSON logging + trace context
 │       └── metrics.py           # Prometheus metrics definitions
 ├── searxng/
-│   └── settings.yml             # Konfigurasi SearXNG
-├── Dockerfile                   # Build image CHIPER
+│   └── settings.yml             # SearXNG configuration
+├── Dockerfile                   # CHIPER image build
 ├── docker-compose.yml           # All-in-one: SearXNG + CHIPER
 ├── requirements.txt             # Python dependencies
-├── IMPROVEMENT.md               # Roadmap ide pengembangan
-├── .env.example                 # Template environment variables
+├── IMPROVEMENT.md               # Improvement roadmap
+├── .env.example                 # Environment variables template
 └── .env                         # Environment variables (private)
 ```
 
 ---
 
-## 🚀 Quick Start (Docker — Direkomendasikan)
+## 🚀 Quick Start (Docker — Recommended)
 
 ```bash
 # 1. Clone repository
 git clone <repo-url> && cd CHIPER
 
-# 2. Buat .env dari template & isi API key
+# 2. Create .env from template and fill in your API key
 cp .env.example .env
-# Edit .env → isi CMD_API_KEY=... dan CMD_BASE_URL=...
+# Edit .env → set CMD_API_KEY=... and CMD_BASE_URL=...
 
-# 3. Jalankan semua service (SearXNG + CHIPER)
+# 3. Run all services (SearXNG + CHIPER)
 docker compose up -d --build
 ```
 
-Setelah selesai:
+Once running:
 - **CHIPER API**: http://localhost:8000
 - **SearXNG**: http://localhost:8081
 - **Health Check**: http://localhost:8000/health
@@ -136,7 +136,7 @@ pip install -r requirements.txt
 # 2. Install Playwright browser
 playwright install chromium
 
-# 3. Jalankan SearXNG via Docker
+# 3. Run SearXNG via Docker
 docker run -d --name searxng -p 8081:8080 \
   -v ./searxng:/etc/searxng \
   -e SEARXNG_BASE_URL=http://localhost:8081/ \
@@ -144,9 +144,9 @@ docker run -d --name searxng -p 8081:8080 \
 
 # 4. Setup environment
 cp .env.example .env
-# Edit .env → isi CMD_API_KEY=... dan CMD_BASE_URL=...
+# Edit .env → set CMD_API_KEY=... and CMD_BASE_URL=...
 
-# 5. Jalankan server
+# 5. Run the server
 python -m app.main
 ```
 
@@ -156,38 +156,38 @@ python -m app.main
 
 ### `POST /api/v1/research`
 
-Menjalankan pipeline riset penuh: SearXNG → Scraping → (opsional) AI Summary.
+Executes the full research pipeline: SearXNG → Scraping → (optional) AI Summary.
 
 #### Request
 
 ```json
 {
-  "query": "Laporan keuangan terbaru perusahaan teknologi",
+  "query": "Latest financial reports from tech companies",
   "max_results": 5,
   "force_js_render": false,
   "generate_summary": true
 }
 ```
 
-| Field | Type | Default | Deskripsi |
-|-------|------|---------|-----------|
-| `query` | string | — | Kata kunci pencarian *(wajib)* |
-| `max_results` | int | `5` | Maksimum URL yang di-scrape (1-20) |
-| `force_js_render` | bool | `false` | Skip Tier-1 (httpx), langsung Playwright |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `query` | string | — | Search query *(required)* |
+| `max_results` | int | `5` | Maximum URLs to scrape (1–20) |
+| `force_js_render` | bool | `false` | Skip Tier-1 (httpx), go straight to Playwright |
 | `generate_summary` | bool | `false` | Generate AI summary via DeepSeek |
 
 #### Response (`generate_summary: true`)
 
 ```json
 {
-  "query": "Laporan keuangan terbaru perusahaan teknologi",
-  "ai_summary": "Berdasarkan ketiga sumber yang diekstrak, mayoritas...",
+  "query": "Latest financial reports from tech companies",
+  "ai_summary": "Based on the three extracted sources, the majority of tech companies reported...",
   "results": [
     {
-      "url": "https://example.com/laporan",
-      "title": "Laporan Keuangan Q1 2025",
+      "url": "https://example.com/report",
+      "title": "Q1 2025 Financial Report",
       "fetch_method": "playwright",
-      "markdown_content": "# Laporan Kuartal...\n\nData menunjukkan...",
+      "markdown_content": "# Quarterly Report...\n\nData shows...",
       "content_length": 1542
     }
   ],
@@ -195,15 +195,15 @@ Menjalankan pipeline riset penuh: SearXNG → Scraping → (opsional) AI Summary
 }
 ```
 
-| Field | Deskripsi |
-|-------|-----------|
-| `query` | Query pencarian original |
-| `ai_summary` | Ringkasan AI (null jika `generate_summary: false`) |
-| `results[].url` | URL hasil scraping |
-| `results[].title` | Judul dari hasil SearXNG |
-| `results[].fetch_method` | `httpx` atau `playwright` |
-| `results[].markdown_content` | Konten bersih dalam format Markdown |
-| `total_results` | Jumlah total hasil scraping |
+| Field | Description |
+|-------|-------------|
+| `query` | Original search query |
+| `ai_summary` | AI-generated summary (null if `generate_summary: false`) |
+| `results[].url` | Scraped URL |
+| `results[].title` | Title from SearXNG result |
+| `results[].fetch_method` | `httpx` or `playwright` |
+| `results[].markdown_content` | Clean extracted Markdown content |
+| `total_results` | Total number of scraped results |
 
 ### `GET /health`
 
@@ -213,36 +213,36 @@ Menjalankan pipeline riset penuh: SearXNG → Scraping → (opsional) AI Summary
 
 ### `GET /metrics`
 
-Mengeluarkan metrik Prometheus (format OpenMetrics), meliputi:
+Exposes Prometheus metrics (OpenMetrics format), including:
 
-| Metrik | Deskripsi |
-|--------|-----------|
-| `chiper_http_requests_total` | Total HTTP requests (method, status) |
-| `chiper_searxng_duration_seconds` | Latency SearXNG API call |
+| Metric | Description |
+|--------|-------------|
+| `chiper_http_requests_total` | Total HTTP requests (by method, status) |
+| `chiper_searxng_duration_seconds` | SearXNG API call latency |
 | `chiper_searxng_requests_total` | Total SearXNG requests (success/error) |
-| `chiper_searxng_results_total` | Total hasil pencarian |
-| `chiper_scrape_duration_seconds` | Latency scraping per URL (per fetch_method) |
-| `chiper_scrape_total` | Total scraping attempt (per fetch_method, status) |
-| `chiper_tier_fallback_total` | Total fallback Tier-1 → Tier-2 |
-| `chiper_summarize_duration_seconds` | Latency AI summarization |
-| `chiper_summarize_total` | Total summarization attempt (success/error) |
+| `chiper_searxng_results_total` | Total search results returned |
+| `chiper_scrape_duration_seconds` | Scraping latency per URL (by fetch_method) |
+| `chiper_scrape_total` | Total scrape attempts (by fetch_method, status) |
+| `chiper_tier_fallback_total` | Total Tier-1 → Tier-2 fallbacks |
+| `chiper_summarize_duration_seconds` | AI summarization latency |
+| `chiper_summarize_total` | Total summarization attempts (success/error) |
 
 ---
 
 ## ⚙️ Environment Variables
 
-| Variable | Default | Deskripsi |
-|----------|---------|-----------|
-| `SEARXNG_BASE_URL` | `http://localhost:8080` | URL SearXNG instance |
-| `CMD_API_KEY` | — | API key untuk AI summarization *(wajib)* |
-| `CMD_BASE_URL` | `http://localhost:20128/v1` | Base URL OpenAI-compatible API |
-| `CMD_MODEL` | `cmc/deepseek/deepseek-v4-pro` | Nama model untuk summarization |
-| `PLAYWRIGHT_BROWSER_PATH` | *(auto)* | Path ke binary Chromium kustom |
-| `HOST` | `0.0.0.0` | Host binding server |
-| `PORT` | `8000` | Port server |
-| `LOG_FORMAT` | `json` | Format log: `json` (structured) atau `console` (human-readable) |
-| `LOG_LEVEL` | `INFO` | Level log: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `MIN_CONTENT_LENGTH` | `200` | Minimal karakter agar Tier-1 dianggap cukup |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SEARXNG_BASE_URL` | `http://localhost:8080` | SearXNG instance URL |
+| `CMD_API_KEY` | — | API key for AI summarization *(required)* |
+| `CMD_BASE_URL` | `http://localhost:20128/v1` | OpenAI-compatible API base URL |
+| `CMD_MODEL` | `cmc/deepseek/deepseek-v4-pro` | Model name for summarization |
+| `PLAYWRIGHT_BROWSER_PATH` | *(auto)* | Custom Chromium binary path |
+| `HOST` | `0.0.0.0` | Server host binding |
+| `PORT` | `8000` | Server port |
+| `LOG_FORMAT` | `json` | Log format: `json` (structured) or `console` (human-readable) |
+| `LOG_LEVEL` | `INFO` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `MIN_CONTENT_LENGTH` | `200` | Minimum characters for Tier-1 to be considered sufficient |
 
 ---
 
@@ -250,7 +250,7 @@ Mengeluarkan metrik Prometheus (format OpenMetrics), meliputi:
 
 ### Structured JSON Logging
 
-Setiap log entry dalam format JSON, siap di-parse oleh Loki / ELK / Datadog:
+Every log entry is machine-parseable JSON, ready for Loki / ELK / Datadog:
 
 ```json
 {
@@ -268,17 +268,17 @@ Setiap log entry dalam format JSON, siap di-parse oleh Loki / ELK / Datadog:
 }
 ```
 
-Ubah ke format human-readable:
+Switch to human-readable format:
 ```bash
-# di .env
+# in .env
 LOG_FORMAT=console
 ```
 
 ### Request Tracing
 
-Setiap request mendapat `X-Request-ID` unik (auto-generated atau dari header incoming). ID ini muncul di:
-- Semua log entry selama request tersebut
-- Response header `X-Request-ID`
+Every request receives a unique `X-Request-ID` (auto-generated or passed from upstream). This ID appears in:
+- All log entries during that request
+- The response header `X-Request-ID`
 
 ```bash
 curl -v http://localhost:8000/health
@@ -287,9 +287,9 @@ curl -v http://localhost:8000/health
 
 ### Prometheus Metrics
 
-Endpoint `/metrics` siap di-scrape Prometheus. **Prometheus tidak wajib diinstall** — endpoint tetap berfungsi dan bisa diakses langsung via browser.
+The `/metrics` endpoint is Prometheus-scrape ready. **Prometheus is not required** — the endpoint works standalone and can be viewed directly in a browser.
 
-**Opsional:** Setup Prometheus + Grafana untuk dashboard visual:
+**Optional:** Set up Prometheus + Grafana for visual dashboards:
 ```yaml
 # prometheus.yml
 scrape_configs:
@@ -301,43 +301,43 @@ scrape_configs:
 
 ---
 
-## 🔄 Flow Two-Tier Scraping
+## 🔄 Two-Tier Scraping Flow
 
 ```
-URL diberikan
+URL received
     │
     ▼
 force_js_render = false?
     │
-    ├── YA ──► Tier 1: httpx (static fetch)
+    ├── YES ──► Tier 1: httpx (static fetch)
     │              │
-    │              ├── HTML didapat & konten >= 200 chars ──► SELESAI
+    │              ├── HTML obtained & content >= 200 chars ──► DONE
     │              │
-    │              └── GAGAL / konten < 200 chars ──► Lanjut Tier 2
+    │              └── FAILED / content < 200 chars ──► Continue to Tier 2
     │
-    └── TIDAK ──► Tier 2: Playwright Chromium (headless)
+    └── NO ────► Tier 2: Playwright Chromium (headless)
                        │
-                       ├── Buka halaman, tunggu network idle
-                       ├── Block gambar/CSS/font (hemat bandwidth)
-                       └── Ambil HTML penuh
+                       ├── Open page, wait for network idle
+                       ├── Block images/CSS/fonts (save bandwidth)
+                       └── Extract full rendered HTML
 
-HTML hasil Tier 1 atau Tier 2
+HTML from Tier 1 or Tier 2
     │
     ▼
-trafilatura → ekstrak konten utama, buang boilerplate
+trafilatura → extract main content, strip boilerplate
     │
     ▼
-Markdown bersih
+Clean Markdown
 ```
 
-Konkurensi diatur dengan `asyncio.gather` + `Semaphore` (max 3 Playwright context sekaligus).
+Concurrency is managed via `asyncio.gather` + `Semaphore` (max 3 simultaneous Playwright contexts).
 
 ---
 
-## 🧪 Contoh cURL
+## 🧪 Example cURL Requests
 
 ```bash
-# Research tanpa AI summary
+# Research without AI summary
 curl -X POST http://localhost:8000/api/v1/research \
   -H "Content-Type: application/json" \
   -d '{"query": "Python FastAPI best practices", "max_results": 3}'
@@ -346,12 +346,12 @@ curl -X POST http://localhost:8000/api/v1/research \
 curl -X POST http://localhost:8000/api/v1/research \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "Laporan keuangan terbaru perusahaan teknologi",
+    "query": "Latest financial reports from tech companies",
     "max_results": 5,
     "generate_summary": true
   }'
 
-# Paksa semua URL pakai Playwright (skip Tier-1)
+# Force Playwright for all URLs (skip Tier-1)
 curl -X POST http://localhost:8000/api/v1/research \
   -H "Content-Type: application/json" \
   -d '{
@@ -360,10 +360,10 @@ curl -X POST http://localhost:8000/api/v1/research \
     "force_js_render": true
   }'
 
-# Lihat metrik Prometheus
+# View Prometheus metrics
 curl http://localhost:8000/metrics
 
-# Lihat trace ID di response header
+# Check trace ID in response headers
 curl -v http://localhost:8000/health
 ```
 
@@ -371,4 +371,4 @@ curl -v http://localhost:8000/health
 
 ## 📝 License
 
-MIT License — lihat file [LICENSE](LICENSE).
+MIT License — see [LICENSE](LICENSE).

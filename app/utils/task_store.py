@@ -5,7 +5,6 @@ Stores background task results for polling via GET /api/v1/research/{task_id}.
 Tasks auto-expire after TTL seconds.
 """
 
-import asyncio
 import time
 import uuid
 from typing import Any
@@ -18,12 +17,13 @@ class TaskStore:
         self._tasks: dict[str, dict] = {}
         self._ttl = ttl  # seconds before auto-cleanup
 
-    def create(self) -> str:
+    def create(self, query: str | None = None) -> str:
         """Create a new task entry and return its ID."""
         task_id = str(uuid.uuid4())
         self._tasks[task_id] = {
             "status": "processing",
             "result": None,
+            "query": query,
             "created_at": time.monotonic(),
         }
         self._cleanup()

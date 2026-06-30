@@ -3,7 +3,7 @@ API Route Handlers
 
 Defines /api/v1/research and /api/v1/research/{task_id} endpoints.
 Protected by circuit breaker (SearXNG) and rate limiting (slowapi).
-Uses background tasks for AI summarization to keep response fast.
+Supports both synchronous and async (background) execution modes via run_async flag.
 Distributes scraping across browser pool (round-robin).
 Instrumented with Prometheus metrics for observability.
 """
@@ -38,9 +38,13 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
     """
     Execute a full research pipeline.
 
-    Steps 1-2 (SearXNG + Scraping) run synchronously and return immediately.
-    Step 3 (AI Summarization) runs in the background if generate_summary=True.
-    Use GET /api/v1/research/{task_id} to poll for the summary result.
+    Two modes:
+    - Synchronous (run_async=False, default): All steps run immediately.
+      If generate_summary=True, AI summarization also runs synchronously
+      and the summary is returned directly in the response.
+    - Async (run_async=True): The entire pipeline (search + scrape + summary)
+      runs as a background task. Returns a task_id immediately.
+      Use GET /api/v1/research/{task_id} to poll for the full result.
     """
     logger.info(
         "Research request received",
@@ -49,9 +53,34 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
             "max_results": payload.max_results,
             "force_js": payload.force_js_render,
             "summary": payload.generate_summary,
+            "run_async": payload.run_async,
         },
     )
 
+    # ── Async Mode: run entire pipeline in background ──────────────
+    if payload.run_async:
+        task_id = task_store.create(payload.query)
+        logger.info(
+            "Starting background full-research pipeline",
+            extra={"task_id": task_id, "query": payload.query},
+        )
+        asyncio.create_task(
+            _run_full_research(
+                task_id=task_id,
+                payload=payload,
+                http_client=request.app.state.http_client,
+                browsers=request.app.state.playwright_browsers,
+                searxng_circuit=request.app.state.searxng_circuit,
+            )
+        )
+        return ResearchResponse(
+            query=payload.query,
+            task_id=task_id,
+            results=[],
+            total_results=0,
+        )
+
+    # ── Sync Mode ───────────────────────────────────────────────────
     # Shared resources from app state
     http_client = request.app.state.http_client
     browsers = request.app.state.playwright_browsers
@@ -122,22 +151,32 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
 
     success_count = sum(1 for r in results if r.content_length > 0)
 
-    # ── Step 3: AI Summarization (background) ──────────────────────
+    # ── Step 3: AI Summarization (sync in this mode) ───────────
     if payload.generate_summary:
         documents = [r.markdown_content for r in results if r.markdown_content]
         if documents:
-            task_id = task_store.create()
             logger.info(
-                "Starting background summarization",
-                extra={"task_id": task_id, "document_count": len(documents)},
+                "Running summarization synchronously",
+                extra={"document_count": len(documents)},
             )
+            try:
+                ai_summary = await summarizer.summarize(documents, payload.query)
+            except Exception as exc:
+                logger.error("Summarization failed", extra={"error": str(exc)})
+                ai_summary = f"Summarization failed: {exc}"
 
-            asyncio.create_task(_run_summarization(task_id, documents, payload.query))
+            logger.info(
+                "Research complete (with summary)",
+                extra={
+                    "query": payload.query,
+                    "total_results": len(results),
+                    "success_count": success_count,
+                },
+            )
 
             return ResearchResponse(
                 query=payload.query,
-                task_id=task_id,
-                ai_summary=None,
+                ai_summary=ai_summary,
                 results=results,
                 total_results=len(results),
             )
@@ -158,30 +197,128 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
     )
 
 
-async def _run_summarization(task_id: str, documents: list[str], query: str) -> None:
-    """Background task: run AI summarization and store result in task store."""
+async def _run_full_research(
+    task_id: str,
+    payload: ResearchRequest,
+    http_client,
+    browsers,
+    searxng_circuit,
+) -> None:
+    """Background task: run the entire research pipeline and store full result."""
     try:
-        summary = await summarizer.summarize(documents, query)
-        task_store.complete(task_id, summary)
-        logger.info("Background summarization done", extra={"task_id": task_id})
+        # ── Step 1: SearXNG (with circuit breaker) ────────────────
+        try:
+            async with searxng_circuit:
+                search_results = await searxng.search(
+                    query=payload.query,
+                    client=http_client,
+                    max_results=payload.max_results,
+                )
+                searxng_circuit.success()
+        except CircuitBreakerOpenError as exc:
+            logger.warning("SearXNG circuit breaker open: %s", exc)
+            task_store.complete(
+                task_id,
+                {"query": payload.query, "results": [], "total_results": 0},
+            )
+            return
+        except RuntimeError as exc:
+            logger.error("SearXNG stage failed: %s", exc)
+            task_store.fail(task_id, str(exc))
+            return
+
+        if not search_results:
+            logger.info(
+                "No search results from SearXNG", extra={"query": payload.query}
+            )
+            task_store.complete(
+                task_id,
+                {"query": payload.query, "results": [], "total_results": 0},
+            )
+            return
+
+        urls = [r["url"] for r in search_results if r.get("url")]
+        logger.info(
+            "Starting scraping phase (background)",
+            extra={"query": payload.query, "url_count": len(urls)},
+        )
+
+        # ── Step 2: Two-Tier Scraping ─────────────────────────────
+        scrape_results = await scraper.scrape_urls(
+            urls=urls,
+            browsers=browsers,
+            client=http_client,
+            force_js_render=payload.force_js_render,
+            max_concurrent_playwright=3,
+        )
+
+        search_by_url = {r["url"]: r for r in search_results}
+        results = []
+        for sr in scrape_results:
+            meta = search_by_url.get(sr["url"], {})
+            results.append(
+                {
+                    "url": sr["url"],
+                    "title": meta.get("title"),
+                    "fetch_method": sr["fetch_method"],
+                    "markdown_content": sr["markdown_content"],
+                    "content_length": sr["content_length"],
+                }
+            )
+
+        # ── Step 3: AI Summarization (always run in async mode) ────
+        ai_summary = None
+        documents = [r["markdown_content"] for r in results if r["markdown_content"]]
+        if documents:
+            try:
+                ai_summary = await summarizer.summarize(documents, payload.query)
+            except Exception as exc:
+                logger.error(
+                    "Summarization failed in background",
+                    extra={"task_id": task_id, "error": str(exc)},
+                )
+                ai_summary = f"Summarization failed: {exc}"
+
+        success_count = sum(1 for r in results if r["content_length"] > 0)
+        logger.info(
+            "Background research complete",
+            extra={
+                "task_id": task_id,
+                "query": payload.query,
+                "total_results": len(results),
+                "success_count": success_count,
+            },
+        )
+
+        task_store.complete(
+            task_id,
+            {
+                "query": payload.query,
+                "ai_summary": ai_summary,
+                "results": results,
+                "total_results": len(results),
+            },
+        )
+
     except Exception as exc:
         error_msg = str(exc)
         task_store.fail(task_id, error_msg)
         logger.error(
-            "Background summarization failed",
+            "Background full-research failed",
             extra={"task_id": task_id, "error": error_msg},
         )
 
 
-@router.get("/research/{task_id}", response_model=TaskStatusResponse)
-async def get_task_status(task_id: str) -> TaskStatusResponse:
+@router.get("/research/{task_id}")
+async def get_task_status(task_id: str):
     """
-    Poll for the result of a background summarization task.
+    Poll for the result of a background full-research task (run_async=true).
 
     Returns:
-        - status="processing": summary is still being generated
-        - status="done": summary is ready (ai_summary field populated)
-        - status="error": summarization failed (ai_summary contains error message)
+        - status="processing": task is still running
+        - status="done": result is ready (query, results, total_results, ai_summary populated)
+        - status="error": task failed (ai_summary contains error message)
+        - status="not_found": task_id not found or expired
     """
     task = task_store.get(task_id)
 
@@ -191,8 +328,38 @@ async def get_task_status(task_id: str) -> TaskStatusResponse:
             status="not_found",
         )
 
+    if task["status"] == "done":
+        result = task["result"]
+        if isinstance(result, dict):
+            raw_results = result.get("results", [])
+            scraped = [
+                ScrapeResult(
+                    url=r["url"],
+                    title=r.get("title"),
+                    fetch_method=r["fetch_method"],
+                    markdown_content=r["markdown_content"],
+                    content_length=r.get("content_length", 0),
+                )
+                for r in raw_results
+            ]
+            return TaskStatusResponse(
+                task_id=task_id,
+                status="done",
+                query=result.get("query"),
+                ai_summary=result.get("ai_summary"),
+                results=scraped,
+                total_results=result.get("total_results", 0),
+            )
+
+    if task["status"] == "error":
+        return TaskStatusResponse(
+            task_id=task_id,
+            status="error",
+            ai_summary=task["result"],
+        )
+
     return TaskStatusResponse(
         task_id=task_id,
         status=task["status"],
-        ai_summary=task["result"] if task["status"] in ("done", "error") else None,
+        query=task.get("query"),
     )

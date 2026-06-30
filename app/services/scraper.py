@@ -114,12 +114,19 @@ def _extract_markdown(html: str) -> str:
     logger.debug(
         "trafilatura returned short/empty output; falling back to markdownify."
     )
-    fallback = md(
-        raw_html,
-        heading_style="ATX",
-        strip=["script", "style", "nav", "footer", "iframe"],
-    )
-    return fallback.strip() if fallback else ""
+    try:
+        fallback = md(
+            raw_html,
+            heading_style="ATX",
+            strip=["script", "style", "nav", "footer", "iframe"],
+        )
+        return fallback.strip() if fallback else ""
+    except RecursionError:
+        logger.warning(
+            "markdownify hit recursion limit on HTML (%d chars); using trafilatura output as-is.",
+            len(raw_html),
+        )
+        return (extracted or "").strip()
 
 
 async def _fetch_static(

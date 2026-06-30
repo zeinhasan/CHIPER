@@ -2,9 +2,9 @@
 
 **C**ontent **H**arvesting, **I**ntegration, **P**arsing, and **E**xtraction **R**outine
 
-> *Headless Asynchronous Knowledge Integrator — v2.5 Deep Fetch + AI Summary Edition*
+> *Headless Asynchronous Knowledge Integrator — v1.1.1*
 
-A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. AI summarization runs as a **background task** — the API returns scraped results in <5 seconds. Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, and browser pool.
+A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. Supports **synchronous** mode (all steps run inline, summary returned directly) and **full async/background** mode (entire pipeline runs in background, poll for results). Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, and browser pool.
 
 ---
 
@@ -13,21 +13,26 @@ A Python/FastAPI middleware API that bridges AI agents with SearXNG for automate
 ```mermaid
 flowchart TD
     A[POST /api/v1/research] --> B[Tracing Middleware<br/>X-Request-ID]
-    B --> C[SearXNG<br/>Search Engine]
-    C -->|circuit breaker| D{Two-Tier<br/>Scraping}
+    B --> C{run_async?}
 
-    D -->|Tier 1| E[httpx<br/>Static Fetch]
-    E -->|retry 3x backoff| F{Content OK?}
-    F -->|yes| G[Clean Markdown]
-    F -->|no / JS garbage| H[Tier 2]
-    D -->|force_js_render| H
+    C -->|true| Z[Background Task<br/>Entire Pipeline]
+    Z --> Z1["GET /research/{id}<br/>Poll for full result"]
 
-    H[Playwright<br/>Dynamic Render] -->|retry 2x + browser pool| G
+    C -->|false| D[SearXNG<br/>Search Engine]
+    D -->|circuit breaker| E{Two-Tier<br/>Scraping}
 
-    G --> I{generate_summary?}
-    I -->|no| J[Return Results]
-    I -->|yes| K[Background Task<br/>DeepSeek Summary]
-    K --> L["GET /research/{id}<br/>Poll for result"]
+    E -->|Tier 1| F[httpx<br/>Static Fetch]
+    F -->|retry 3x backoff| G{Content OK?}
+    G -->|yes| H[Clean Markdown]
+    G -->|no / JS garbage| I[Tier 2]
+    E -->|force_js_render| I
+
+    I[Playwright<br/>Dynamic Render] -->|retry 2x + browser pool| H
+
+    H --> J{generate_summary?}
+    J -->|yes| K[Sync AI Summarization<br/>DeepSeek]
+    K --> L[Return Full Results]
+    J -->|no| L
 ```
 
 ---
@@ -106,7 +111,9 @@ Once running:
 
 ### `POST /api/v1/research`
 
-Executes the research pipeline. Scraping runs synchronously; AI summarization runs as a background task (non-blocking).
+Executes the research pipeline. Supports two modes:
+- **Synchronous** (`run_async: false`, default): All steps run immediately. If `generate_summary: true`, the AI summary is returned directly in the response (no polling needed).
+- **Async** (`run_async: true`): Entire pipeline (search + scrape + summary) runs as background task. Returns `task_id` immediately. Poll `GET /research/{task_id}` for full result.
 
 #### Request
 
@@ -115,7 +122,8 @@ Executes the research pipeline. Scraping runs synchronously; AI summarization ru
   "query": "Latest financial reports from tech companies",
   "max_results": 5,
   "force_js_render": false,
-  "generate_summary": true
+  "generate_summary": true,
+  "run_async": false
 }
 ```
 
@@ -124,15 +132,17 @@ Executes the research pipeline. Scraping runs synchronously; AI summarization ru
 | `query` | string | — | Search query *(required)* |
 | `max_results` | int | `5` | Maximum URLs to scrape (1–20) |
 | `force_js_render` | bool | `false` | Skip Tier-1 for all URLs |
-| `generate_summary` | bool | `false` | Generate AI summary (background task) |
+| `generate_summary` | bool | `false` | Generate AI summary. Runs synchronously when `run_async: false` (summary returned directly). |
+| `run_async` | bool | `false` | Run entire pipeline as background task. Returns `task_id` immediately. Poll `GET /research/{task_id}` for full result. |
 
-#### Response — With Summary (Background Task)
+#### Response — With Summary (Sync Mode)
+
+When `run_async: false` and `generate_summary: true`, the summary is returned directly:
 
 ```json
 {
   "query": "DSSA Anjlok",
-  "task_id": "a1b2c3d4-...",
-  "ai_summary": null,
+  "ai_summary": "PT Dian Swastatika Sentosa Tbk (DSSA) membukukan laba bersih...",
   "results": [{
     "url": "https://...",
     "title": "Saham DSSA Anjlok...",
@@ -147,8 +157,8 @@ Executes the research pipeline. Scraping runs synchronously; AI summarization ru
 | Field | Description |
 |-------|-------------|
 | `query` | Original search query |
-| `task_id` | Background task ID (null if `generate_summary: false`) |
-| `ai_summary` | AI summary (null in initial response — poll to get it) |
+| `task_id` | Background task ID (only populated when `run_async: true`) |
+| `ai_summary` | AI summary (populated when `generate_summary: true`; null otherwise) |
 | `results[].url` | Scraped URL |
 | `results[].title` | Title from SearXNG |
 | `results[].fetch_method` | `httpx` or `playwright` |
@@ -157,19 +167,19 @@ Executes the research pipeline. Scraping runs synchronously; AI summarization ru
 
 ### `GET /api/v1/research/{task_id}`
 
-Poll for the result of a background summarization task.
+Poll for the result of a background full-research task (used with `run_async: true`).
 
 | `status` | Meaning |
 |----------|---------|
-| `processing` | Summary is still being generated |
-| `done` | Summary is ready |
-| `error` | Summarization failed |
+| `processing` | Task is still being processed |
+| `done` | Task is ready — `results`, `total_results`, and `ai_summary` are populated |
+| `error` | Task failed (error message in `ai_summary`) |
 | `not_found` | Task ID not found or expired |
 
 ### `GET /health`
 
 ```json
-{ "status": "ok", "version": "2.5.0" }
+{ "status": "ok", "version": "1.1.1" }
 ```
 
 ### `GET /metrics`
@@ -230,12 +240,17 @@ curl -X POST http://localhost:8000/api/v1/research \
   -H "Content-Type: application/json" \
   -d '{"query": "DSSA Anjlok", "max_results": 3}'
 
-# Research + summary (background, <5s return)
+# Research + summary (synchronous, returns summary directly)
 curl -X POST http://localhost:8000/api/v1/research \
   -H "Content-Type: application/json" \
   -d '{"query": "DSSA Anjlok", "max_results": 5, "generate_summary": true}'
 
-# Poll for summary
+# Full async research (entire pipeline in background, instant return)
+curl -X POST http://localhost:8000/api/v1/research \
+  -H "Content-Type: application/json" \
+  -d '{"query": "DSSA Anjlok", "max_results": 5, "run_async": true}'
+
+# Poll for async research result
 curl http://localhost:8000/api/v1/research/abc-123
 
 # Force Playwright

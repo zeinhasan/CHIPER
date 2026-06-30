@@ -29,6 +29,10 @@ class ResearchRequest(BaseModel):
         default=False,
         description="If True, aggregate all scraped content and generate an AI summary via DeepSeek.",
     )
+    run_async: bool = Field(
+        default=False,
+        description="If True, run the entire research pipeline as a background task. Use GET /api/v1/research/{task_id} to poll for results. When enabled, summarization is always triggered regardless of generate_summary.",
+    )
 
 
 class ScrapeResult(BaseModel):
@@ -52,9 +56,11 @@ class ResearchResponse(BaseModel):
 
 
 class TaskStatusResponse(BaseModel):
-    """API response for polling a background summarization task."""
+    """API response for polling a background task (summarization or full research)."""
 
     task_id: str
-    status: str  # "processing", "done", "error"
+    status: str  # "processing", "done", "error", "not_found"
     query: str | None = None
     ai_summary: str | None = None
+    results: list[ScrapeResult] | None = None
+    total_results: int | None = None

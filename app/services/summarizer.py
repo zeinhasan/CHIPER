@@ -29,6 +29,9 @@ SYSTEM_PROMPT = (
     "Jangan membuat klaim yang tidak didukung oleh konten yang diberikan."
 )
 
+# Maximum characters per document to avoid exceeding model token limits.
+MAX_DOC_CHARS = 4000
+
 
 def _build_user_prompt(documents: list[str], query: str) -> str:
     """Build the user prompt containing the query and all scraped documents."""
@@ -68,20 +71,38 @@ async def summarize(documents: list[str], query: str) -> str:
     if not documents:
         return "Tidak ada konten yang dapat diringkas (semua scraping gagal)."
 
+    # Truncate large documents to avoid exceeding model token limits.
+    total_before = sum(len(d) for d in documents)
+    truncated_docs: list[str] = []
+    for i, doc in enumerate(documents):
+        if len(doc) > MAX_DOC_CHARS:
+            truncated_docs.append(doc[:MAX_DOC_CHARS] + "\n\n[... konten dipotong ...]")
+            logger.info(
+                "Document #%d truncated",
+                i + 1,
+                extra={
+                    "original_chars": len(doc),
+                    "truncated_to": MAX_DOC_CHARS,
+                },
+            )
+        else:
+            truncated_docs.append(doc)
+    total_after = sum(len(d) for d in truncated_docs)
+
     client = AsyncOpenAI(
         base_url=settings.cmd_base_url,
         api_key=settings.cmd_api_key,
     )
 
-    user_prompt = _build_user_prompt(documents, query)
-    total_chars = sum(len(d) for d in documents)
+    user_prompt = _build_user_prompt(truncated_docs, query)
 
     logger.info(
         "Sending summarization request",
         extra={
             "model": settings.cmd_model,
-            "document_count": len(documents),
-            "total_chars": total_chars,
+            "document_count": len(truncated_docs),
+            "total_chars_before": total_before,
+            "total_chars_after": total_after,
         },
     )
 

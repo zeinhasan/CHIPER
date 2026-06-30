@@ -1,7 +1,8 @@
 """
 API Route Handlers
 
-Defines /api/v1/research and /api/v1/research/{task_id} endpoints.
+Defines /api/v1/research, /api/v1/research/{task_id},
+/api/v1/crawl, and /api/v1/crawl/{task_id} endpoints.
 Protected by circuit breaker (SearXNG) and rate limiting (slowapi).
 Supports both synchronous and async (background) execution modes via run_async flag.
 Distributes scraping across browser pool (round-robin).
@@ -16,12 +17,16 @@ from slowapi.util import get_remote_address
 
 from app.config import settings
 from app.models.schemas import (
+    CrawlPage,
+    CrawlRequest,
+    CrawlResponse,
+    CrawlTaskStatusResponse,
     ResearchRequest,
     ResearchResponse,
     ScrapeResult,
     TaskStatusResponse,
 )
-from app.services import scraper, searxng, summarizer
+from app.services import crawler, scraper, searxng, summarizer
 from app.utils.circuit_breaker import CircuitBreakerOpenError
 from app.utils.helpers import get_logger
 from app.utils.task_store import task_store
@@ -417,3 +422,217 @@ async def get_task_status(task_id: str):
         status=task["status"],
         query=task.get("query"),
     )
+
+
+# ── Crawl ────────────────────────────────────────────────────────────────
+
+
+@router.post("/crawl", response_model=CrawlResponse)
+@limiter.limit(settings.crawl_rate_limit)
+async def crawl_endpoint(request: Request, payload: CrawlRequest) -> CrawlResponse:
+    """
+    Recursively crawl a website, following internal links and extracting Markdown.
+
+    Supports two modes:
+    - Synchronous (run_async=False, default): Crawl runs immediately, returns full results.
+    - Async (run_async=True): Crawl runs as background task.
+      Use GET /api/v1/crawl/{task_id} to poll for progress and results.
+    """
+    logger.info(
+        "Crawl request received",
+        extra={
+            "url": payload.url,
+            "max_depth": payload.max_depth,
+            "max_pages": payload.max_pages,
+            "force_js": payload.force_js_render,
+            "summary": payload.generate_summary,
+            "run_async": payload.run_async,
+        },
+    )
+
+    # ── Async Mode ────────────────────────────────────────────────
+    if payload.run_async:
+        task_id = task_store.create(payload.url)
+        logger.info(
+            "Starting background crawl", extra={"task_id": task_id, "url": payload.url}
+        )
+        asyncio.create_task(
+            _run_crawl_background(
+                task_id=task_id,
+                payload=payload,
+                http_client=request.app.state.http_client,
+                browsers=request.app.state.playwright_browsers,
+            )
+        )
+        return CrawlResponse(
+            base_url=payload.url, total_pages=0, task_id=task_id, results=[]
+        )
+
+    # ── Sync Mode ─────────────────────────────────────────────────
+    http_client = request.app.state.http_client
+    browsers = request.app.state.playwright_browsers
+
+    crawl_results = await crawler.crawl(
+        seed_url=payload.url,
+        max_depth=payload.max_depth,
+        max_pages=payload.max_pages,
+        include_paths=payload.include_paths,
+        exclude_paths=payload.exclude_paths,
+        force_js_render=payload.force_js_render,
+        http_client=http_client,
+        browsers=browsers,
+    )
+
+    # ── Optional AI Summarization ──────────────────────────────────
+    ai_summary: str | None = None
+    if payload.generate_summary:
+        documents = [
+            r["markdown_content"] for r in crawl_results if r.get("markdown_content")
+        ]
+        if documents:
+            logger.info(
+                "Running crawl summarization",
+                extra={"document_count": len(documents)},
+            )
+            try:
+                ai_summary = await summarizer.summarize(documents, payload.url)
+            except Exception as exc:
+                logger.error("Crawl summarization failed", extra={"error": str(exc)})
+                ai_summary = f"Summarization failed: {exc}"
+
+    pages = [
+        CrawlPage(
+            url=r["url"],
+            title=r.get("title"),
+            depth=r.get("depth", 0),
+            fetch_method=r.get("fetch_method", "unknown"),
+            markdown_content=r.get("markdown_content", ""),
+            content_length=r.get("content_length", 0),
+            links_found=r.get("links_found", 0),
+        )
+        for r in crawl_results
+    ]
+
+    logger.info(
+        "Crawl complete",
+        extra={
+            "url": payload.url,
+            "total_pages": len(pages),
+        },
+    )
+
+    return CrawlResponse(
+        base_url=payload.url,
+        total_pages=len(pages),
+        results=pages,
+        ai_summary=ai_summary,
+    )
+
+
+async def _run_crawl_background(
+    task_id: str,
+    payload: CrawlRequest,
+    http_client,
+    browsers,
+) -> None:
+    """Background task: execute full crawl pipeline and store result in task_store."""
+    try:
+        crawl_results = await crawler.crawl(
+            seed_url=payload.url,
+            max_depth=payload.max_depth,
+            max_pages=payload.max_pages,
+            include_paths=payload.include_paths,
+            exclude_paths=payload.exclude_paths,
+            force_js_render=payload.force_js_render,
+            http_client=http_client,
+            browsers=browsers,
+        )
+
+        ai_summary: str | None = None
+        if payload.generate_summary:
+            documents = [
+                r["markdown_content"]
+                for r in crawl_results
+                if r.get("markdown_content")
+            ]
+            if documents:
+                try:
+                    ai_summary = await summarizer.summarize(documents, payload.url)
+                except Exception as exc:
+                    ai_summary = f"Summarization failed: {exc}"
+
+        pages = [
+            {
+                "url": r["url"],
+                "title": r.get("title"),
+                "depth": r.get("depth", 0),
+                "fetch_method": r.get("fetch_method", "unknown"),
+                "markdown_content": r.get("markdown_content", ""),
+                "content_length": r.get("content_length", 0),
+                "links_found": r.get("links_found", 0),
+            }
+            for r in crawl_results
+        ]
+
+        task_store.complete(
+            task_id,
+            {
+                "base_url": payload.url,
+                "total_pages": len(pages),
+                "ai_summary": ai_summary,
+                "results": pages,
+            },
+        )
+
+        logger.info(
+            "Background crawl complete",
+            extra={"task_id": task_id, "total_pages": len(pages)},
+        )
+
+    except Exception as exc:
+        error_msg = str(exc)
+        task_store.fail(task_id, error_msg)
+        logger.error(
+            "Background crawl failed",
+            extra={"task_id": task_id, "error": error_msg},
+        )
+
+
+@router.get("/crawl/{task_id}")
+async def get_crawl_task_status(task_id: str) -> CrawlTaskStatusResponse:
+    """
+    Poll for the result of a background crawl task (run_async=true).
+
+    Returns:
+        - status="processing": task is still running
+        - status="done": result is ready (base_url, total_pages, results, ai_summary)
+        - status="error": task failed (ai_summary contains error message)
+        - status="not_found": task_id not found or expired
+    """
+    task = task_store.get(task_id)
+
+    if task is None:
+        return CrawlTaskStatusResponse(task_id=task_id, status="not_found")
+
+    if task["status"] == "done":
+        result = task["result"]
+        if isinstance(result, dict):
+            raw_results = result.get("results", [])
+            pages = [CrawlPage(**r) for r in raw_results]
+            return CrawlTaskStatusResponse(
+                task_id=task_id,
+                status="done",
+                base_url=result.get("base_url"),
+                total_pages=result.get("total_pages"),
+                ai_summary=result.get("ai_summary"),
+                results=pages,
+            )
+
+    if task["status"] == "error":
+        return CrawlTaskStatusResponse(
+            task_id=task_id,
+            status="error",
+            ai_summary=task["result"],  # error message stored in result
+        )
+
+    return CrawlTaskStatusResponse(task_id=task_id, status=task["status"])

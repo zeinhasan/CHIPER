@@ -45,6 +45,11 @@ class Settings:
 
     # --- Reliability: Rate Limiting ---
     rate_limit: str = os.getenv("RATE_LIMIT", "30/minute")
+    crawl_rate_limit: str = os.getenv("CRAWL_RATE_LIMIT", "5/minute")
+
+    # --- Crawl ---
+    crawl_max_concurrent: int = int(os.getenv("CRAWL_MAX_CONCURRENT", "5"))
+    crawl_delay_ms: int = int(os.getenv("CRAWL_DELAY_MS", "500"))
 
 
 # Singleton instance

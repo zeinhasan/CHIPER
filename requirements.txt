@@ -19,3 +19,6 @@ prometheus-fastapi-instrumentator>=7.0.0
 
 # Reliability
 slowapi>=0.1.9
+
+# HTML Parsing (link extraction for crawler)
+beautifulsoup4>=4.12.0

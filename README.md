@@ -2,9 +2,9 @@
 
 **C**ontent **H**arvesting, **I**ntegration, **P**arsing, and **E**xtraction **R**outine
 
-> *Headless Asynchronous Knowledge Integrator — v1.1.1*
+> *Headless Asynchronous Knowledge Integrator — v1.2.0*</new_text>
 
-A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. Supports **synchronous** mode (all steps run inline, summary returned directly) and **full async/background** mode (entire pipeline runs in background, poll for results). Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, browser pool, configurable search categories, and domain filtering for non-scrapable media sites.
+A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. Now with **recursive multi-page crawl** — start from one URL and follow internal links depth-by-depth, with path filtering, configurable concurrency, and optional AI summarization of all crawled pages. Supports **synchronous** mode (all steps run inline, summary returned directly) and **full async/background** mode (entire pipeline runs in background, poll for results). Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, browser pool, configurable search categories, and domain filtering for non-scrapable media sites.
 
 ---
 
@@ -71,12 +71,14 @@ CHIPER/
 │   ├── services/
 │   │   ├── searxng.py           # SearXNG JSON API integration
 │   │   ├── scraper.py           # Two-Tier scraping + JS garbage detection + browser pool
+│   │   ├── crawler.py           # BFS recursive crawl engine (NEW)
 │   │   └── summarizer.py        # AI summarization (DeepSeek)
 │   └── utils/
 │       ├── helpers.py           # Re-export logging utilities
 │       ├── logging.py           # Structured JSON logging + trace context
 │       ├── metrics.py           # Prometheus metrics definitions
 │       ├── circuit_breaker.py   # 3-state circuit breaker
+│       ├── links.py             # URL normalization + internal link extraction (NEW)
 │       └── task_store.py        # In-memory background task store
 ├── searxng/
 │   └── settings.yml             # SearXNG configuration
@@ -176,10 +178,89 @@ Poll for the result of a background full-research task (used with `run_async: tr
 | `error` | Task failed (error message in `ai_summary`) |
 | `not_found` | Task ID not found or expired |
 
+### `POST /api/v1/crawl`
+
+Recursively crawl a website, following same-domain internal links and extracting clean Markdown from every page. Built on the Two-Tier scraping engine.
+
+Supports two modes:
+- **Synchronous** (`run_async: false`, default): Crawl runs immediately, returns full results.
+- **Async** (`run_async: true`): Crawl runs as background task. Returns `task_id` immediately. Poll `GET /crawl/{task_id}` for results.
+
+#### Request
+
+```json
+{
+  "url": "http://quotes.toscrape.com",
+  "max_depth": 2,
+  "max_pages": 10,
+  "include_paths": ["/tag/.*"],
+  "exclude_paths": ["/login.*"],
+  "force_js_render": false,
+  "generate_summary": false,
+  "run_async": false
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | — | Starting URL to crawl *(required)* |
+| `max_depth` | int | `3` | Maximum crawl depth from base URL (1–10) |
+| `max_pages` | int | `20` | Maximum total pages to crawl (1–100) |
+| `include_paths` | list\[string\] | `[]` | Regex patterns for path whitelist |
+| `exclude_paths` | list\[string\] | `[]` | Regex patterns for path blacklist |
+| `force_js_render` | bool | `false` | Use Playwright for all pages (skip Tier-1) |
+| `generate_summary` | bool | `false` | Generate AI summary of all crawled content |
+| `run_async` | bool | `false` | Run crawl as background task |
+
+#### Response (Sync Mode)
+
+```json
+{
+  "base_url": "http://quotes.toscrape.com",
+  "total_pages": 5,
+  "results": [
+    {
+      "url": "http://quotes.toscrape.com",
+      "title": "Quotes to Scrape",
+      "depth": 0,
+      "fetch_method": "httpx",
+      "markdown_content": "# Quotes to Scrape\n\n...",
+      "content_length": 2890,
+      "links_found": 46
+    }
+  ],
+  "task_id": null,
+  "ai_summary": null
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `base_url` | Starting URL (normalized) |
+| `total_pages` | Number of successfully crawled pages |
+| `results[].url` | Page URL |
+| `results[].depth` | Depth level from seed (0 = seed) |
+| `results[].fetch_method` | `httpx` or `playwright` |
+| `results[].links_found` | Number of internal links discovered |
+| `results[].markdown_content` | Clean extracted Markdown |
+| `task_id` | Background task ID (only when `run_async: true`) |
+| `ai_summary` | AI summary (only when `generate_summary: true`) |
+
+### `GET /api/v1/crawl/{task_id}`
+
+Poll for the result of a background crawl task (used with `run_async: true`).
+
+| `status` | Meaning |
+|----------|---------|
+| `processing` | Task is still being processed |
+| `done` | Task is ready — `base_url`, `total_pages`, `results`, `ai_summary` populated |
+| `error` | Task failed (error message in `ai_summary`) |
+| `not_found` | Task ID not found or expired |
+
 ### `GET /health`
 
 ```json
-{ "status": "ok", "version": "1.1.1" }
+{ "status": "ok", "version": "1.2.0" }
 ```
 
 ### `GET /metrics`
@@ -210,6 +291,9 @@ Exposes Prometheus metrics (OpenMetrics format).
 | `CIRCUIT_BREAKER_FAILURES` | `5` | Failures before opening SearXNG circuit |
 | `CIRCUIT_BREAKER_TIMEOUT` | `30.0` | Seconds before half-opening circuit |
 | `RATE_LIMIT` | `30/minute` | Max requests per IP |
+| `CRAWL_RATE_LIMIT` | `5/minute` | Max crawl requests per IP |
+| `CRAWL_MAX_CONCURRENT` | `5` | Max concurrent scrapes per crawl |
+| `CRAWL_DELAY_MS` | `500` | Per-page delay in milliseconds |
 
 ---
 
@@ -258,6 +342,31 @@ curl http://localhost:8000/api/v1/research/abc-123
 curl -X POST http://localhost:8000/api/v1/research \
   -H "Content-Type: application/json" \
   -d '{"query": "React 19 features", "max_results": 3, "force_js_render": true}'
+
+# ── Crawl ────────────────────────────────────────────
+
+# Basic crawl (depth 1, max 3 pages)
+curl -X POST http://localhost:8000/api/v1/crawl \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://quotes.toscrape.com", "max_depth": 1, "max_pages": 3}'
+
+# Crawl with path whitelist (only /tag/ pages)
+curl -X POST http://localhost:8000/api/v1/crawl \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://quotes.toscrape.com", "max_depth": 2, "max_pages": 15, "include_paths": ["/tag/.*"]}'
+
+# Async crawl (returns task_id immediately)
+curl -X POST http://localhost:8000/api/v1/crawl \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://quotes.toscrape.com", "max_depth": 1, "max_pages": 5, "run_async": true}'
+
+# Poll for async crawl result
+curl http://localhost:8000/api/v1/crawl/{task_id}
+
+# Crawl + AI summary
+curl -X POST http://localhost:8000/api/v1/crawl \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://quotes.toscrape.com", "max_depth": 1, "max_pages": 5, "generate_summary": true}'
 ```
 
 ---

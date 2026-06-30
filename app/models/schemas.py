@@ -64,3 +64,79 @@ class TaskStatusResponse(BaseModel):
     ai_summary: str | None = None
     results: list[ScrapeResult] | None = None
     total_results: int | None = None
+
+
+# ── Crawl ─────────────────────────────────────────────────────────────
+
+
+class CrawlRequest(BaseModel):
+    """Incoming crawl payload."""
+
+    url: str = Field(
+        ...,
+        min_length=1,
+        max_length=2048,
+        description="Starting URL to crawl.",
+    )
+    max_depth: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum crawl depth from the base URL.",
+    )
+    max_pages: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum total pages to crawl.",
+    )
+    include_paths: list[str] = Field(
+        default_factory=list,
+        description="Regex patterns to include (whitelist).",
+    )
+    exclude_paths: list[str] = Field(
+        default_factory=list,
+        description="Regex patterns to exclude (blacklist).",
+    )
+    force_js_render: bool = Field(
+        default=False,
+        description="If True, use Playwright for all pages (skip Tier-1).",
+    )
+    generate_summary: bool = Field(
+        default=False,
+        description="If True, generate AI summary of all crawled content.",
+    )
+    run_async: bool = Field(
+        default=False,
+        description="If True, run crawl as background task. Use GET /api/v1/crawl/{task_id} to poll.",
+    )
+
+
+class CrawlPage(ScrapeResult):
+    """Extends ScrapeResult with crawl-specific fields."""
+
+    depth: int = Field(..., description="Depth level from seed URL (0 = seed).")
+    links_found: int = Field(
+        default=0, description="Number of internal links found on this page."
+    )
+
+
+class CrawlResponse(BaseModel):
+    """API response for a crawl request."""
+
+    base_url: str
+    total_pages: int
+    results: list[CrawlPage]
+    task_id: str | None = None
+    ai_summary: str | None = None
+
+
+class CrawlTaskStatusResponse(BaseModel):
+    """API response for polling a background crawl task."""
+
+    task_id: str
+    status: str  # "processing", "done", "error", "not_found"
+    base_url: str | None = None
+    total_pages: int | None = None
+    ai_summary: str | None = None
+    results: list[CrawlPage] | None = None

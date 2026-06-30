@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.0] — 2026-06-30
+
+### Added
+- **Web Crawl (Recursive)** — `POST /api/v1/crawl` endpoint that performs BFS multi-page crawl from a seed URL, following same-domain internal links and extracting Markdown from every page. Supports configurable depth, page limits, path filtering (include/exclude regex), async background mode with polling (`GET /api/v1/crawl/{task_id}`), and optional AI summarization of all crawled content. Built on top of the existing Two-Tier scraping engine. (`crawler.py`, `links.py`, `routes.py`, `schemas.py`)
+- `CRAWL_RATE_LIMIT` env var — separate rate limit for crawl endpoint (default `5/minute`). (`config.py`)
+- `CRAWL_MAX_CONCURRENT` env var — max concurrent scrapes per crawl (default `5`). (`config.py`)
+- `CRAWL_DELAY_MS` env var — per-page delay for rate limiting (default `500`). (`config.py`)
+- `beautifulsoup4` dependency — HTML parsing for internal link extraction. (`requirements.txt`)
+
+### Changed
+- `CrawlPage` model extends `ScrapeResult` — avoids field duplication. (`schemas.py`)
+- Crawl endpoint uses separate rate limit (`crawl_rate_limit`) from research endpoint. (`routes.py`)
+
+---
+
 ## [1.1.2] — 2026-06-30
 
 ### Added

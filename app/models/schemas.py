@@ -2,6 +2,8 @@
 Pydantic models for CHIPER API request/response validation.
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -140,3 +142,91 @@ class CrawlTaskStatusResponse(BaseModel):
     total_pages: int | None = None
     ai_summary: str | None = None
     results: list[CrawlPage] | None = None
+
+
+# ── Site Map Discovery ───────────────────────────────────────────────
+
+
+class MapRequest(BaseModel):
+    """Incoming site map discovery payload."""
+
+    url: str = Field(
+        ...,
+        min_length=1,
+        max_length=2048,
+        description="Base URL to discover.",
+    )
+    discovery_method: Literal["sitemap", "crawl", "hybrid"] = Field(
+        default="hybrid",
+        description="Method: 'sitemap' (parse sitemap.xml only), "
+        "'crawl' (link-following only), 'hybrid' (sitemap then crawl).",
+    )
+    max_urls: int = Field(
+        default=500,
+        ge=1,
+        le=5000,
+        description="Maximum URLs to return.",
+    )
+    max_depth: int = Field(
+        default=10,
+        ge=1,
+        le=20,
+        description="Maximum crawl depth (crawl/hybrid only).",
+    )
+    include_paths: list[str] = Field(
+        default_factory=list,
+        description="Regex patterns to include (whitelist).",
+    )
+    exclude_paths: list[str] = Field(
+        default_factory=list,
+        description="Regex patterns to exclude (blacklist).",
+    )
+    include_subdomains: bool = Field(
+        default=False,
+        description="If True, treat subdomains as internal.",
+    )
+    ignore_query_params: bool = Field(
+        default=False,
+        description="If True, strip query params before dedup.",
+    )
+    run_async: bool = Field(
+        default=False,
+        description="If True, run as background task. Use GET /api/v1/map/{task_id} to poll.",
+    )
+
+
+class MapUrl(BaseModel):
+    """A single discovered URL entry."""
+
+    url: str
+    path: str
+    depth: int
+    source: str  # "sitemap" or "crawl"
+    last_modified: str | None = None
+
+
+class MapResponse(BaseModel):
+    """API response for a site map discovery request."""
+
+    base_url: str
+    total_urls: int
+    urls: list[MapUrl]
+    sitemap_url: str | None = None
+    discovery_method: str
+    sitemap_count: int = 0
+    crawl_count: int = 0
+    task_id: str | None = None
+
+
+class MapTaskStatusResponse(BaseModel):
+    """API response for polling a background map discovery task."""
+
+    task_id: str
+    status: str  # "processing", "done", "error", "not_found"
+    base_url: str | None = None
+    total_urls: int | None = None
+    urls: list[MapUrl] | None = None
+    sitemap_url: str | None = None
+    discovery_method: str | None = None
+    sitemap_count: int | None = None
+    crawl_count: int | None = None

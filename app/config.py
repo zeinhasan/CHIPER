@@ -51,6 +51,10 @@ class Settings:
     crawl_max_concurrent: int = int(os.getenv("CRAWL_MAX_CONCURRENT", "5"))
     crawl_delay_ms: int = int(os.getenv("CRAWL_DELAY_MS", "500"))
 
+    # --- Map Discovery ---
+    map_max_concurrent: int = int(os.getenv("MAP_MAX_CONCURRENT", "10"))
+    map_delay_ms: int = int(os.getenv("MAP_DELAY_MS", "200"))
+
 
 # Singleton instance
 settings = Settings()

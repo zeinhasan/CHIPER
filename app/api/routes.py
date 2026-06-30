@@ -2,7 +2,8 @@
 API Route Handlers
 
 Defines /api/v1/research, /api/v1/research/{task_id},
-/api/v1/crawl, and /api/v1/crawl/{task_id} endpoints.
+/api/v1/crawl, /api/v1/crawl/{task_id},
+/api/v1/map, and /api/v1/map/{task_id} endpoints.
 Protected by circuit breaker (SearXNG) and rate limiting (slowapi).
 Supports both synchronous and async (background) execution modes via run_async flag.
 Distributes scraping across browser pool (round-robin).
@@ -21,12 +22,16 @@ from app.models.schemas import (
     CrawlRequest,
     CrawlResponse,
     CrawlTaskStatusResponse,
+    MapRequest,
+    MapResponse,
+    MapTaskStatusResponse,
+    MapUrl,
     ResearchRequest,
     ResearchResponse,
     ScrapeResult,
     TaskStatusResponse,
 )
-from app.services import crawler, scraper, searxng, summarizer
+from app.services import crawler, discovery, scraper, searxng, summarizer
 from app.utils.circuit_breaker import CircuitBreakerOpenError
 from app.utils.helpers import get_logger
 from app.utils.task_store import task_store
@@ -636,3 +641,176 @@ async def get_crawl_task_status(task_id: str) -> CrawlTaskStatusResponse:
         )
 
     return CrawlTaskStatusResponse(task_id=task_id, status=task["status"])
+
+
+# ── Site Map Discovery ───────────────────────────────────────────────────
+
+
+@router.post("/map", response_model=MapResponse)
+@limiter.limit(settings.crawl_rate_limit)
+async def map_endpoint(request: Request, payload: MapRequest) -> MapResponse:
+    """
+    Discover all URLs on a website.
+
+    Supports three discovery methods:
+    - sitemap: Parse sitemap.xml only (fast, relies on site's sitemap).
+    - crawl: Lightweight BFS link-follower (no content scraping).
+    - hybrid: Sitemap first, then crawl to fill gaps (default).
+
+    Supports async mode via run_async=True — poll with GET /api/v1/map/{task_id}.
+    """
+    logger.info(
+        "Map request received",
+        extra={
+            "url": payload.url,
+            "method": payload.discovery_method,
+            "max_urls": payload.max_urls,
+            "max_depth": payload.max_depth,
+            "include_subdomains": payload.include_subdomains,
+        },
+    )
+
+    # ── Async Mode ────────────────────────────────────────────────
+    if payload.run_async:
+        task_id = task_store.create(payload.url)
+        logger.info(
+            "Starting background map discovery",
+            extra={"task_id": task_id, "url": payload.url},
+        )
+        asyncio.create_task(
+            _run_map_background(
+                task_id=task_id,
+                payload=payload,
+                http_client=request.app.state.http_client,
+            )
+        )
+        return MapResponse(
+            base_url=payload.url,
+            total_urls=0,
+            urls=[],
+            task_id=task_id,
+            discovery_method=payload.discovery_method,
+        )
+
+    # ── Sync Mode ─────────────────────────────────────────────────
+    client = request.app.state.http_client
+    result = await discovery.run_discovery(
+        url=payload.url,
+        discovery_method=payload.discovery_method,
+        max_urls=payload.max_urls,
+        max_depth=payload.max_depth,
+        include_paths=payload.include_paths,
+        exclude_paths=payload.exclude_paths,
+        include_subdomains=payload.include_subdomains,
+        ignore_query_params=payload.ignore_query_params,
+        client=client,
+    )
+
+    urls = [MapUrl(**u) for u in result["urls"]]
+
+    logger.info(
+        "Map discovery complete",
+        extra={
+            "url": payload.url,
+            "total_urls": len(urls),
+        },
+    )
+
+    return MapResponse(
+        base_url=payload.url,
+        total_urls=len(urls),
+        urls=urls,
+        sitemap_url=result.get("sitemap_url"),
+        discovery_method=result["discovery_method"],
+        sitemap_count=result.get("sitemap_count", 0),
+        crawl_count=result.get("crawl_count", 0),
+    )
+
+
+async def _run_map_background(
+    task_id: str,
+    payload: MapRequest,
+    http_client,
+) -> None:
+    """Background task: execute URL discovery and store result in task_store."""
+    try:
+        result = await discovery.run_discovery(
+            url=payload.url,
+            discovery_method=payload.discovery_method,
+            max_urls=payload.max_urls,
+            max_depth=payload.max_depth,
+            include_paths=payload.include_paths,
+            exclude_paths=payload.exclude_paths,
+            include_subdomains=payload.include_subdomains,
+            ignore_query_params=payload.ignore_query_params,
+            client=http_client,
+        )
+
+        task_store.complete(
+            task_id,
+            {
+                "base_url": payload.url,
+                "total_urls": len(result["urls"]),
+                "urls": result["urls"],
+                "sitemap_url": result.get("sitemap_url"),
+                "discovery_method": result["discovery_method"],
+                "sitemap_count": result.get("sitemap_count", 0),
+                "crawl_count": result.get("crawl_count", 0),
+            },
+        )
+
+        logger.info(
+            "Background map discovery complete",
+            extra={"task_id": task_id, "total_urls": len(result["urls"])},
+        )
+
+    except Exception as exc:
+        error_msg = str(exc)
+        task_store.fail(task_id, error_msg)
+        logger.error(
+            "Background map discovery failed",
+            extra={"task_id": task_id, "error": error_msg},
+        )
+
+
+@router.get("/map/{task_id}")
+async def get_map_task_status(task_id: str) -> MapTaskStatusResponse:
+    """
+    Poll for the result of a background map discovery task (run_async=true).
+
+    Returns:
+        - status="processing": task is still running
+        - status="done": result is ready (base_url, total_urls, urls, etc.)
+        - status="error": task failed (base_url contains error message)
+        - status="not_found": task_id not found or expired
+    """
+    task = task_store.get(task_id)
+
+    if task is None:
+        return MapTaskStatusResponse(task_id=task_id, status="not_found")
+
+    if task["status"] == "done":
+        result = task["result"]
+        if isinstance(result, dict):
+            raw_urls = result.get("urls", [])
+            urls = [MapUrl(**u) for u in raw_urls]
+            return MapTaskStatusResponse(
+                task_id=task_id,
+                status="done",
+                base_url=result.get("base_url"),
+                total_urls=result.get("total_urls"),
+                urls=urls,
+                sitemap_url=result.get("sitemap_url"),
+                discovery_method=result.get("discovery_method"),
+                sitemap_count=result.get("sitemap_count"),
+                crawl_count=result.get("crawl_count"),
+            )
+
+    if task["status"] == "error":
+        return MapTaskStatusResponse(
+            task_id=task_id,
+            status="error",
+            base_url=task["result"],  # error message stored in result
+        )
+
+    return MapTaskStatusResponse(task_id=task_id, status=task["status"])

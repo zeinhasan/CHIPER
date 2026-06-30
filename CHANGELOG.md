@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.0] — 2026-06-30
+
+### Added
+- **Site Map Discovery** — `POST /api/v1/map` endpoint that discovers all URLs on a website without scraping content. Supports three modes: `sitemap` (parse sitemap.xml + sitemap index + robots.txt), `crawl` (lightweight BFS link-follower — no Playwright, no content extraction), and `hybrid` (sitemap first, then crawl to fill gaps). Includes path filtering (include/exclude regex), subdomain inclusion toggle, query param stripping, configurable depth/URL limits, async background mode with polling (`GET /api/v1/map/{task_id}`). (`discovery.py`, `sitemap.py`, `routes.py`, `schemas.py`)
+- `MAP_MAX_CONCURRENT` env var — max concurrent requests during map discovery (default `10`). (`config.py`)
+- `MAP_DELAY_MS` env var — per-page delay during map discovery (default `200`). (`config.py`)
+
+### Changed
+- `_is_internal()` in `links.py` extended with optional `include_subdomains` parameter — when True, subdomains like `blog.example.com` are considered internal to `example.com`. Backward compatible (defaults to `False`). (`links.py`)
+- `normalize_url()` in `links.py` extended with optional `strip_query` parameter — when True, query parameters are stripped before building the canonical URL. Backward compatible (defaults to `False`). (`links.py`)
+- Arch diagram in README now includes Map Discovery pipeline subgraph. (`README.md`)
+
+---
+
 ## [1.2.0] — 2026-06-30
 
 ### Added

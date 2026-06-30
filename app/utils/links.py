@@ -21,7 +21,7 @@ _SKIP_SCHEMES: frozenset[str] = frozenset(
 )
 
 
-def normalize_url(url: str) -> str:
+def normalize_url(url: str, strip_query: bool = False) -> str:
     """
     Produce a canonical, dedup-safe form of a URL.
 
@@ -31,6 +31,7 @@ def normalize_url(url: str) -> str:
     - Lowercases the scheme and hostname (domain).
     - Strips the fragment (``#section``).
     - Strips trailing slash from the path (unless path is ``/``).
+    - (Optional) Strips query parameters when *strip_query* is True.
 
     Returns an empty string when input is falsy or whitespace-only.
     """
@@ -57,14 +58,21 @@ def normalize_url(url: str) -> str:
         path = path.rstrip("/")
 
     # ── Rebuild canonical URL ──────────────────────────────────────
-    normalized = urlunparse((scheme, netloc, path, parsed.params, parsed.query, ""))
+    if strip_query:
+        normalized = urlunparse((scheme, netloc, path, "", "", ""))
+    else:
+        normalized = urlunparse((scheme, netloc, path, parsed.params, parsed.query, ""))
 
     return normalized
 
 
-def _is_internal(url: str, base_url: str) -> bool:
+def _is_internal(url: str, base_url: str, include_subdomains: bool = False) -> bool:
     """
-    Return True if *url* shares the same (scheme, hostname) as *base_url*.
+    Return True if *url* shares the same domain as *base_url*.
+
+    If *include_subdomains* is True, subdomains are considered internal
+    (e.g. blog.example.com is internal to example.com).  Guarded against
+    false positives like ``notexample.com`` passing for ``example.com``.
 
     Handles both absolute and relative URLs (relative URLs are considered
     internal by default, but callers should resolve them first via urljoin).
@@ -72,8 +80,14 @@ def _is_internal(url: str, base_url: str) -> bool:
     try:
         target = urlparse(url)
         base = urlparse(base_url)
+        if target.scheme != base.scheme:
+            return False
+        if include_subdomains:
+            base_host = base.hostname or ""
+            target_host = target.hostname or ""
+            return target_host == base_host or target_host.endswith("." + base_host)
         # Subdomain is NOT considered internal (e.g. api.example.com != example.com).
-        return target.scheme == base.scheme and target.hostname == base.hostname
+        return target.hostname == base.hostname
     except Exception:
         return False
 

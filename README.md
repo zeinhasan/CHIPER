@@ -2,9 +2,9 @@
 
 **C**ontent **H**arvesting, **I**ntegration, **P**arsing, and **E**xtraction **R**outine
 
-> *Headless Asynchronous Knowledge Integrator — v1.2.0*
+> *Headless Asynchronous Knowledge Integrator — v1.3.0*
 
-A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. Now with **recursive multi-page crawl** — start from one URL and follow internal links depth-by-depth, with path filtering, configurable concurrency, and optional AI summarization of all crawled pages. Supports **synchronous** mode (all steps run inline, summary returned directly) and **full async/background** mode (entire pipeline runs in background, poll for results). Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, browser pool, configurable search categories, and domain filtering for non-scrapable media sites.
+A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. Now with **recursive multi-page crawl** — start from one URL and follow internal links depth-by-depth, and **site map discovery** — auto-discover every URL on a website via sitemap.xml parsing or lightweight crawl. Supports **synchronous** mode (all steps run inline, summary returned directly) and **full async/background** mode (entire pipeline runs in background, poll for results). Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, browser pool, configurable search categories, and domain filtering for non-scrapable media sites.
 
 ---
 
@@ -49,6 +49,23 @@ flowchart TD
         C10 -->|no| C12[Return Results]
         C11 --> C12
     end
+
+    subgraph Map["🗺️ Map Discovery — /api/v1/map"]
+        direction TB
+        M1[POST /map] --> M2[Tracing Middleware]
+        M2 --> M3{run_async?}
+        M3 -->|true| M4[Background Task]
+        M4 --> M4a["GET /map/{id}"]
+        M3 -->|false| M5{discovery_method}
+        M5 -->|"sitemap"| M6["Parse sitemap.xml<br/>+ robots.txt"]
+        M5 -->|"hybrid"| M7["Sitemap first"]
+        M7 --> M8{enough URLs?}
+        M8 -->|no| M9["Lightweight BFS Crawl<br/>GET HTML + extract links"]
+        M9 --> M10[Return URLs]
+        M8 -->|yes| M10
+        M6 --> M10
+        M5 -->|"crawl"| M9
+    end
 ```
 
 ---
@@ -83,18 +100,20 @@ CHIPER/
 │   ├── models/
 │   │   └── schemas.py           # Pydantic request/response validation
 │   ├── api/
-│   │   └── routes.py            # POST /research + GET /research/{task_id}
+│   │   └── routes.py            # POST /research + /crawl + /map endpoints
 │   ├── services/
 │   │   ├── searxng.py           # SearXNG JSON API integration
 │   │   ├── scraper.py           # Two-Tier scraping + JS garbage detection + browser pool
-│   │   ├── crawler.py           # BFS recursive crawl engine (NEW)
+│   │   ├── crawler.py           # BFS recursive crawl engine
+│   │   ├── discovery.py         # Site map discovery engine (NEW — sitemap + lightweight crawl)
 │   │   └── summarizer.py        # AI summarization (DeepSeek)
 │   └── utils/
 │       ├── helpers.py           # Re-export logging utilities
 │       ├── logging.py           # Structured JSON logging + trace context
 │       ├── metrics.py           # Prometheus metrics definitions
 │       ├── circuit_breaker.py   # 3-state circuit breaker
-│       ├── links.py             # URL normalization + internal link extraction (NEW)
+│       ├── links.py             # URL normalization + internal link extraction
+│       ├── sitemap.py           # Sitemap XML parser (NEW — urlset + sitemap index + robots.txt)
 │       └── task_store.py        # In-memory background task store
 ├── searxng/
 │   └── settings.yml             # SearXNG configuration
@@ -273,10 +292,105 @@ Poll for the result of a background crawl task (used with `run_async: true`).
 | `error` | Task failed (error message in `ai_summary`) |
 | `not_found` | Task ID not found or expired |
 
+### `POST /api/v1/map`
+
+Discover all URLs on a website. Does **not** scrape content — purely discovers URLs. Ideal before bulk scraping to understand site structure.
+
+Supports three discovery methods:
+- **`sitemap`** — Parse `sitemap.xml` (and sitemap index) for instant discovery. Fast, low-cost.
+- **`crawl`** — Lightweight BFS link-follower (GET HTML → extract `<a href>` → move on). No content scraping, no JS rendering.
+- **`hybrid`** (default) — Sitemap first, then crawl to fill gaps. Best of both worlds.
+
+Supports **synchronous** (`run_async: false`, default) and **async** (`run_async: true`) with polling via `GET /map/{task_id}`.
+
+#### Request
+
+```json
+{
+  "url": "https://docs.example.com",
+  "discovery_method": "hybrid",
+  "max_urls": 100,
+  "max_depth": 3,
+  "include_paths": ["^/docs/", "^/api/"],
+  "exclude_paths": ["^/admin/", "\\.pdf$"],
+  "include_subdomains": false,
+  "ignore_query_params": false,
+  "run_async": false
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | — | Base URL to discover *(required)* |
+| `discovery_method` | string | `"hybrid"` | `"sitemap"`, `"crawl"`, or `"hybrid"` |
+| `max_urls` | int | `500` | Maximum URLs to return (1–5000) |
+| `max_depth` | int | `10` | Maximum crawl depth (crawl/hybrid only, 1–20) |
+| `include_paths` | list\[string\] | `[]` | Regex patterns for path whitelist |
+| `exclude_paths` | list\[string\] | `[]` | Regex patterns for path blacklist |
+| `include_subdomains` | bool | `false` | Treat subdomains as internal (e.g. `blog.example.com`) |
+| `ignore_query_params` | bool | `false` | Strip `?query=...` before dedup |
+| `run_async` | bool | `false` | Run as background task |
+
+#### Response (Sync Mode)
+
+```json
+{
+  "base_url": "https://docs.example.com",
+  "total_urls": 42,
+  "urls": [
+    {
+      "url": "https://docs.example.com/intro",
+      "path": "/intro",
+      "depth": 1,
+      "source": "sitemap",
+      "last_modified": "2025-06-15T08:00:00Z"
+    },
+    {
+      "url": "https://docs.example.com/guide/install",
+      "path": "/guide/install",
+      "depth": 2,
+      "source": "crawl",
+      "last_modified": null
+    }
+  ],
+  "sitemap_url": "https://docs.example.com/sitemap.xml",
+  "discovery_method": "hybrid",
+  "sitemap_count": 30,
+  "crawl_count": 12,
+  "task_id": null
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `base_url` | Starting URL (normalized) |
+| `total_urls` | Total unique URLs discovered |
+| `urls[].url` | Full canonical URL |
+| `urls[].path` | Path only (no scheme/host) |
+| `urls[].depth` | Distance from seed URL (0 = seed) |
+| `urls[].source` | `"sitemap"` or `"crawl"` |
+| `urls[].last_modified` | ISO-8601 from `<lastmod>` in sitemap (if available) |
+| `sitemap_url` | Discovered sitemap URL (if found) |
+| `sitemap_count` | URLs discovered via sitemap |
+| `crawl_count` | URLs discovered via crawl |
+| `discovery_method` | Method used (`sitemap`, `crawl`, or `hybrid`) |
+| `task_id` | Background task ID (only when `run_async: true`) |
+
+### `GET /api/v1/map/{task_id}`
+
+Poll for the result of a background map discovery task (used with `run_async: true`).
+
+| `status` | Meaning |
+|----------|---------|
+| `processing` | Task is still being processed |
+| `done` | Task is ready — `base_url`, `total_urls`, `urls`, `sitemap_url` populated |
+| `error` | Task failed (error message in `base_url`) |
+| `not_found` | Task ID not found or expired |
+
 ### `GET /health`
 
 ```json
-{ "status": "ok", "version": "1.2.0" }
+{ "status": "ok", "version": "1.3.0" }
 ```
 
 ### `GET /metrics`
@@ -310,6 +424,8 @@ Exposes Prometheus metrics (OpenMetrics format).
 | `CRAWL_RATE_LIMIT` | `5/minute` | Max crawl requests per IP |
 | `CRAWL_MAX_CONCURRENT` | `5` | Max concurrent scrapes per crawl |
 | `CRAWL_DELAY_MS` | `500` | Per-page delay in milliseconds |
+| `MAP_MAX_CONCURRENT` | `10` | Max concurrent requests during map discovery |
+| `MAP_DELAY_MS` | `200` | Per-page delay during map discovery (milliseconds) |
 
 ---
 
@@ -383,6 +499,36 @@ curl http://localhost:8000/api/v1/crawl/{task_id}
 curl -X POST http://localhost:8000/api/v1/crawl \
   -H "Content-Type: application/json" \
   -d '{"url": "http://quotes.toscrape.com", "max_depth": 1, "max_pages": 5, "generate_summary": true}'
+
+# ── Map Discovery ────────────────────────────────────
+
+# Quick map discovery (hybrid mode — sitemap + crawl)
+curl -X POST http://localhost:8000/api/v1/map \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://quotes.toscrape.com", "max_urls": 50}'
+
+# Sitemap-only (fastest, relies on site's sitemap.xml)
+curl -X POST http://localhost:8000/api/v1/map \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://quotes.toscrape.com", "discovery_method": "sitemap", "max_urls": 100}'
+
+# Crawl-only (no sitemap, lightweight link-following)
+curl -X POST http://localhost:8000/api/v1/map \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://quotes.toscrape.com", "discovery_method": "crawl", "max_urls": 50, "max_depth": 2}'
+
+# Map with path filters (only /tag/ pages, exclude /login)
+curl -X POST http://localhost:8000/api/v1/map \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://quotes.toscrape.com", "discovery_method": "hybrid", "max_urls": 100, "include_paths": ["/tag/.*"], "exclude_paths": ["/login.*"]}'
+
+# Async map discovery (returns task_id immediately)
+curl -X POST http://localhost:8000/api/v1/map \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://quotes.toscrape.com", "max_urls": 200, "run_async": true}'
+
+# Poll for async map result
+curl http://localhost:8000/api/v1/map/{task_id}
 ```
 
 ---

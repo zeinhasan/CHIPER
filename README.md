@@ -2,7 +2,7 @@
 
 **C**ontent **H**arvesting, **I**ntegration, **P**arsing, and **E**xtraction **R**outine
 
-> *Headless Asynchronous Knowledge Integrator — v1.2.0*</new_text>
+> *Headless Asynchronous Knowledge Integrator — v1.2.0*
 
 A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. Now with **recursive multi-page crawl** — start from one URL and follow internal links depth-by-depth, with path filtering, configurable concurrency, and optional AI summarization of all crawled pages. Supports **synchronous** mode (all steps run inline, summary returned directly) and **full async/background** mode (entire pipeline runs in background, poll for results). Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, browser pool, configurable search categories, and domain filtering for non-scrapable media sites.
 
@@ -12,27 +12,43 @@ A Python/FastAPI middleware API that bridges AI agents with SearXNG for automate
 
 ```mermaid
 flowchart TD
-    A[POST /api/v1/research] --> B[Tracing Middleware<br/>X-Request-ID]
-    B --> C{run_async?}
+    subgraph Research["🔍 Research Pipeline — /api/v1/research"]
+        direction TB
+        R1[POST /research] --> R2[Tracing Middleware]
+        R2 --> R3{run_async?}
+        R3 -->|true| R4[Background Task]
+        R4 --> R4a["GET /research/{id}"]
+        R3 -->|false| R5[SearXNG Search]
+        R5 -->|circuit breaker| R6{Two-Tier Scraping}
+        R6 -->|"Tier 1"| R7[httpx Static]
+        R7 -->|retry 3x| R8{Content OK?}
+        R8 -->|yes| R9[Clean Markdown]
+        R8 -->|"no / JS garbage"| R10["Tier 2: Playwright"]
+        R6 -->|force_js| R10
+        R10 -->|retry 2x| R9
+        R9 --> R11{summarize?}
+        R11 -->|yes| R12[AI Summary]
+        R11 -->|no| R13[Return Results]
+        R12 --> R13
+    end
 
-    C -->|true| Z[Background Task<br/>Entire Pipeline]
-    Z --> Z1["GET /research/{id}<br/>Poll for full result"]
-
-    C -->|false| D[SearXNG<br/>Search Engine]
-    D -->|circuit breaker| E{Two-Tier<br/>Scraping}
-
-    E -->|Tier 1| F[httpx<br/>Static Fetch]
-    F -->|retry 3x backoff| G{Content OK?}
-    G -->|yes| H[Clean Markdown]
-    G -->|no / JS garbage| I[Tier 2]
-    E -->|force_js_render| I
-
-    I[Playwright<br/>Dynamic Render] -->|retry 2x + browser pool| H
-
-    H --> J{generate_summary?}
-    J -->|yes| K[Sync AI Summarization<br/>DeepSeek]
-    K --> L[Return Full Results]
-    J -->|no| L
+    subgraph Crawl["🕷️ Crawl Pipeline — /api/v1/crawl"]
+        direction TB
+        C1[POST /crawl] --> C2[Tracing Middleware]
+        C2 --> C3{run_async?}
+        C3 -->|true| C4[Background Task]
+        C4 --> C4a["GET /crawl/{id}"]
+        C3 -->|false| C5[Seed URL + BFS Queue]
+        C5 --> C6["Depth Batch<br/>concurrent scrape"]
+        C6 --> C7[Two-Tier Scrape]
+        C7 --> C8["Extract Links<br/>regex path filter"]
+        C8 --> C9{more pages?}
+        C9 -->|yes| C6
+        C9 -->|no| C10{summarize?}
+        C10 -->|yes| C11[AI Summary]
+        C10 -->|no| C12[Return Results]
+        C11 --> C12
+    end
 ```
 
 ---

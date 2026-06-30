@@ -4,7 +4,7 @@
 
 > *Headless Asynchronous Knowledge Integrator — v1.1.1*
 
-A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. Supports **synchronous** mode (all steps run inline, summary returned directly) and **full async/background** mode (entire pipeline runs in background, poll for results). Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, and browser pool.
+A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. Supports **synchronous** mode (all steps run inline, summary returned directly) and **full async/background** mode (entire pipeline runs in background, poll for results). Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, browser pool, configurable search categories, and domain filtering for non-scrapable media sites.
 
 ---
 
@@ -193,6 +193,7 @@ Exposes Prometheus metrics (OpenMetrics format).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SEARXNG_BASE_URL` | `http://localhost:8080` | SearXNG instance URL |
+| `SEARXNG_CATEGORIES` | `web,news` | SearXNG search categories (comma-separated). Default excludes videos, images, and files. |
 | `CMD_API_KEY` | — | API key for AI summarization *(required)* |
 | `CMD_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible API base URL |
 | `CMD_MODEL` | `deepseek/deepseek-chat` | Model name for summarization |

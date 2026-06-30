@@ -12,6 +12,7 @@ class Settings:
 
     # --- SearXNG ---
     searxng_base_url: str = os.getenv("SEARXNG_BASE_URL", "http://localhost:8080")
+    searxng_categories: str = os.getenv("SEARXNG_CATEGORIES", "web,news")
 
     # --- AI Summarization (OpenAI-compatible) ---
     cmd_api_key: str = os.getenv("CMD_API_KEY", "")

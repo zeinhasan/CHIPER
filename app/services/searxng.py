@@ -36,7 +36,7 @@ async def search(
     params = {
         "q": query,
         "format": "json",
-        "categories": "general",
+        "categories": settings.searxng_categories,
         "pageno": 1,
     }
 

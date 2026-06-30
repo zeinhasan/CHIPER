@@ -28,6 +28,43 @@ from app.utils.task_store import task_store
 
 logger = get_logger(__name__)
 
+# Domains that are video/image/media platforms and not scrapable for text research.
+# These are filtered out before scraping to avoid wasting resources.
+BLOCKED_DOMAINS: set[str] = {
+    "youtube.com",
+    "www.youtube.com",
+    "youtu.be",
+    "m.youtube.com",
+    "vimeo.com",
+    "www.vimeo.com",
+    "dailymotion.com",
+    "www.dailymotion.com",
+    "tiktok.com",
+    "www.tiktok.com",
+    "instagram.com",
+    "www.instagram.com",
+    "twitch.tv",
+    "www.twitch.tv",
+    "bilibili.com",
+    "www.bilibili.com",
+    "rumble.com",
+    "www.rumble.com",
+    "odysee.com",
+    "www.odysee.com",
+}
+
+
+def _is_blocked_domain(url: str) -> bool:
+    """Check if a URL is from a blocked video/media domain."""
+    from urllib.parse import urlparse
+
+    try:
+        hostname = urlparse(url).hostname or ""
+        return hostname.lower() in BLOCKED_DOMAINS
+    except Exception:
+        return False
+
+
 router = APIRouter(prefix="/api/v1", tags=["research"])
 limiter = Limiter(key_func=get_remote_address, default_limits=[settings.rate_limit])
 
@@ -120,14 +157,22 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
 
     urls = [r["url"] for r in search_results if r.get("url")]
 
+    # Filter out video/media domains that can't be scraped for text
+    filtered_urls = [u for u in urls if not _is_blocked_domain(u)]
+    if len(filtered_urls) < len(urls):
+        logger.info(
+            "Filtered out blocked domains",
+            extra={"before": len(urls), "after": len(filtered_urls)},
+        )
+
     logger.info(
         "Starting scraping phase",
-        extra={"query": payload.query, "url_count": len(urls)},
+        extra={"query": payload.query, "url_count": len(filtered_urls)},
     )
 
     # ── Step 2: Two-Tier Scraping (browser pool, round-robin) ─────
     scrape_results = await scraper.scrape_urls(
-        urls=urls,
+        urls=filtered_urls,
         browsers=browsers,
         client=http_client,
         force_js_render=payload.force_js_render,
@@ -238,14 +283,23 @@ async def _run_full_research(
             return
 
         urls = [r["url"] for r in search_results if r.get("url")]
+
+        # Filter out video/media domains that can't be scraped for text
+        filtered_urls = [u for u in urls if not _is_blocked_domain(u)]
+        if len(filtered_urls) < len(urls):
+            logger.info(
+                "Filtered out blocked domains (background)",
+                extra={"before": len(urls), "after": len(filtered_urls)},
+            )
+
         logger.info(
             "Starting scraping phase (background)",
-            extra={"query": payload.query, "url_count": len(urls)},
+            extra={"query": payload.query, "url_count": len(filtered_urls)},
         )
 
         # ── Step 2: Two-Tier Scraping ─────────────────────────────
         scrape_results = await scraper.scrape_urls(
-            urls=urls,
+            urls=filtered_urls,
             browsers=browsers,
             client=http_client,
             force_js_render=payload.force_js_render,

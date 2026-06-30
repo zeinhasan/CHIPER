@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.2] — 2026-06-30
+
+### Added
+- `SEARXNG_CATEGORIES` env var — configurable SearXNG search categories (default `"web,news"`). Allows narrowing search scope to text-only content, excluding videos/images/files. (`config.py`, `searxng.py`)
+- Domain blocklist filtering — automatically skips video/media domains (YouTube, Vimeo, TikTok, Instagram, Twitch, etc.) before scraping, preventing wasted resources on non-scrapable URLs. (`routes.py`)
+
+### Changed
+- SearXNG search categories narrowed from `"general"` (all categories including videos) to `"web,news"` by default, preventing YouTube/video results from entering the research pipeline. (`searxng.py`)
+
+### Fixed
+- YouTube results appearing in search results for non-video queries (e.g., "Macbook neo tokopedia") — caused by SearXNG `"general"` category including video engines.
+
+### Security
+- Disabled video engines (youtube, vimeo, dailymotion, rumble, odysee, bilibili) and image engines (google images, duckduckgo images, bing images) in SearXNG config to prevent unnecessary engine usage. (`searxng/settings.yml`)
+
+---
+
 ## [1.1.1] — 2026-06-30
 
 ### Added

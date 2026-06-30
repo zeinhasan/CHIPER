@@ -27,7 +27,7 @@ redis:
   url: false
 
 # Engine Management
-# Disabled: google, brave, startpage, bing, qwant
+# Disabled: google, brave, startpage, bing, qwant, and video/media engines
 # Enabled:  duckduckgo, wikipedia, wikidata
 engines:
   - name: google
@@ -46,6 +46,28 @@ engines:
     disabled: false
   - name: wikidata
     disabled: false
+  # Disable video engines to prevent YouTube/video results
+  - name: youtube
+    disabled: true
+  - name: youtube_noapi
+    disabled: true
+  - name: vimeo
+    disabled: true
+  - name: dailymotion
+    disabled: true
+  - name: rumble
+    disabled: true
+  - name: odysee
+    disabled: true
+  - name: bilibili
+    disabled: true
+  # Disable image engines (not useful for text scraping)
+  - name: google images
+    disabled: true
+  - name: duckduckgo images
+    disabled: true
+  - name: bing images
+    disabled: true
 
 outgoing:
   request_timeout: 10.0

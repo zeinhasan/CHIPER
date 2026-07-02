@@ -22,3 +22,6 @@ slowapi>=0.1.9
 
 # HTML Parsing (link extraction for crawler)
 beautifulsoup4>=4.12.0
+
+# JSON Schema Validation (structured extraction)
+jsonschema>=4.20.0

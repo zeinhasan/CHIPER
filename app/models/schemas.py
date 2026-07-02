@@ -230,3 +230,71 @@ class MapTaskStatusResponse(BaseModel):
     discovery_method: str | None = None
     sitemap_count: int | None = None
     crawl_count: int | None = None
+
+
+# ── Structured Data Extraction ─────────────────────────────────────
+
+
+class ExtractRequest(BaseModel):
+    """Incoming structured data extraction payload."""
+
+    urls: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="List of URLs to extract data from (1-20).",
+    )
+    prompt: str = Field(
+        ...,
+        min_length=10,
+        max_length=2000,
+        description="Natural-language description of the data to extract.",
+    )
+    json_schema: dict | None = Field(
+        default=None,
+        description="Optional JSON Schema to validate the extracted data.",
+    )
+    extract_mode: Literal["combined", "per_page"] = Field(
+        default="combined",
+        description="'combined' = one extraction from combined content; "
+        "'per_page' = extract each URL independently.",
+    )
+    force_js_render: bool = Field(
+        default=False,
+        description="If True, use Playwright for all pages (skip Tier-1).",
+    )
+    run_async: bool = Field(
+        default=False,
+        description="If True, run as background task. Use GET /api/v1/extract/{task_id} to poll.",
+    )
+
+
+class ExtractData(BaseModel):
+    """A single extraction result for one URL."""
+
+    url: str
+    extraction: dict | list | str | None = None
+    error: str | None = None
+
+
+class ExtractResponse(BaseModel):
+    """API response for an extraction request."""
+
+    success: bool
+    data: list[ExtractData]
+    total_urls: int
+    failed_urls: int = 0
+    extract_mode: str
+    task_id: str | None = None
+
+
+class ExtractTaskStatusResponse(BaseModel):
+    """API response for polling a background extraction task."""
+
+    task_id: str
+    status: str  # "processing", "done", "error", "not_found"
+    success: bool | None = None
+    data: list[ExtractData] | None = None
+    total_urls: int | None = None
+    failed_urls: int | None = None
+    extract_mode: str | None = None

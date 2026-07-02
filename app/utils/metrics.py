@@ -61,6 +61,20 @@ summarize_total = Counter(
     ["status"],  # "success" | "error"
 )
 
+# ── Extraction Metrics ───────────────────────────────────────────────
+
+extract_duration = Histogram(
+    "chiper_extract_duration_seconds",
+    "Duration of AI extraction operations.",
+    buckets=(2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0),
+)
+
+extract_total = Counter(
+    "chiper_extract_total",
+    "Total AI extraction attempts.",
+    ["status", "mode", "has_schema"],  # status: "success" | "partial" | "error"
+)
+
 # ── FastAPI HTTP Metrics Instrumentator ──────────────────────────────
 
 instrumentator = Instrumentator(

@@ -55,6 +55,13 @@ class Settings:
     map_max_concurrent: int = int(os.getenv("MAP_MAX_CONCURRENT", "10"))
     map_delay_ms: int = int(os.getenv("MAP_DELAY_MS", "200"))
 
+    # --- Extraction ---
+    extract_max_urls: int = int(os.getenv("EXTRACT_MAX_URLS", "20"))
+    extract_max_prompt_length: int = int(os.getenv("EXTRACT_MAX_PROMPT_LENGTH", "2000"))
+    extract_max_content_chars: int = int(os.getenv("EXTRACT_MAX_CONTENT_CHARS", "8000"))
+    extract_temperature: float = float(os.getenv("EXTRACT_TEMPERATURE", "0.1"))
+    extract_retries: int = int(os.getenv("EXTRACT_RETRIES", "1"))
+
 
 # Singleton instance
 settings = Settings()

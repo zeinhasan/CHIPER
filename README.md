@@ -4,7 +4,7 @@
 
 > *Headless Asynchronous Knowledge Integrator — v1.3.0*
 
-A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. Now with **recursive multi-page crawl** — start from one URL and follow internal links depth-by-depth, and **site map discovery** — auto-discover every URL on a website via sitemap.xml parsing or lightweight crawl. Supports **synchronous** mode (all steps run inline, summary returned directly) and **full async/background** mode (entire pipeline runs in background, poll for results). Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, browser pool, configurable search categories, and domain filtering for non-scrapable media sites.
+A Python/FastAPI middleware API that bridges AI agents with SearXNG for automated web research. Extracts clean Markdown content from static and JavaScript-heavy pages using a Two-Tier strategy with **auto JS garbage detection**. Now with **recursive multi-page crawl** — start from one URL and follow internal links depth-by-depth, **site map discovery** — auto-discover every URL on a website via sitemap.xml parsing or lightweight crawl, and **structured data extraction** — extract specific fields from web pages using AI with JSON Schema validation. Supports **synchronous** mode (all steps run inline, summary returned directly) and **full async/background** mode (entire pipeline runs in background, poll for results). Full observability + reliability: JSON logging, X-Request-ID tracing, Prometheus metrics, retry+backoff, circuit breaker, rate limiting, connection pool reuse, browser pool, configurable search categories, and domain filtering for non-scrapable media sites.
 
 ---
 
@@ -66,6 +66,21 @@ flowchart TD
         M6 --> M10
         M5 -->|"crawl"| M9
     end
+
+    subgraph Extract["📊 Structured Extraction — /api/v1/extract"]
+        direction TB
+        E1[POST /extract] --> E2[Tracing Middleware]
+        E2 --> E3{run_async?}
+        E3 -->|true| E4[Background Task]
+        E4 --> E4a["GET /extract/{id}"]
+        E3 -->|false| E5[Scrape URLs<br/>Two-Tier concurrent]
+        E5 --> E6{extract_mode}
+        E6 -->|"combined"| E7["Combine all content<br/>+ LLM extraction"]
+        E6 -->|"per_page"| E8["LLM extraction<br/>per URL"]
+        E7 --> E9[Schema Validation<br/>JSON Schema check]
+        E8 --> E9
+        E9 --> E10[Return Structured JSON]
+    end
 ```
 
 ---
@@ -79,7 +94,8 @@ flowchart TD
 | **Static Fetch** | `httpx` (async, shared connection pool) |
 | **Dynamic Render** | `playwright` (headless Chromium, browser pool) |
 | **Content Extractor** | `trafilatura` + `markdownify` |
-| **AI Summarization** | `openai` SDK → OpenRouter → DeepSeek |
+| **AI Summarization** | `openai` SDK → OpenAI-compatible API (DeepSeek, GPT, Claude, etc.) |
+| **AI Extraction** | Structured JSON output via OpenAI-compatible API + `jsonschema` validation |
 | **Reliability** | Retry+backoff, circuit breaker, rate limiting (`slowapi`), browser pool |
 | **Background Tasks** | `asyncio.create_task` + in-memory task store |
 | **Structured Logging** | JSON logs with trace context |
@@ -100,20 +116,21 @@ CHIPER/
 │   ├── models/
 │   │   └── schemas.py           # Pydantic request/response validation
 │   ├── api/
-│   │   └── routes.py            # POST /research + /crawl + /map endpoints
+│   │   └── routes.py            # POST /research + /crawl + /map + /extract endpoints
 │   ├── services/
 │   │   ├── searxng.py           # SearXNG JSON API integration
 │   │   ├── scraper.py           # Two-Tier scraping + JS garbage detection + browser pool
 │   │   ├── crawler.py           # BFS recursive crawl engine
-│   │   ├── discovery.py         # Site map discovery engine (NEW — sitemap + lightweight crawl)
-│   │   └── summarizer.py        # AI summarization (DeepSeek)
+│   │   ├── discovery.py         # Site map discovery engine (sitemap + lightweight crawl)
+│   │   ├── extractor.py         # Structured data extraction engine (AI + JSON Schema)
+│   │   └── summarizer.py        # AI summarization (OpenAI-compatible LLM)
 │   └── utils/
 │       ├── helpers.py           # Re-export logging utilities
 │       ├── logging.py           # Structured JSON logging + trace context
 │       ├── metrics.py           # Prometheus metrics definitions
 │       ├── circuit_breaker.py   # 3-state circuit breaker
 │       ├── links.py             # URL normalization + internal link extraction
-│       ├── sitemap.py           # Sitemap XML parser (NEW — urlset + sitemap index + robots.txt)
+│       ├── sitemap.py           # Sitemap XML parser (urlset + sitemap index + robots.txt)
 │       └── task_store.py        # In-memory background task store
 ├── searxng/
 │   └── settings.yml             # SearXNG configuration
@@ -387,6 +404,118 @@ Poll for the result of a background map discovery task (used with `run_async: tr
 | `error` | Task failed (error message in `base_url`) |
 | `not_found` | Task ID not found or expired |
 
+### `POST /api/v1/extract`
+
+Extract structured data from one or more URLs using an OpenAI-compatible LLM (DeepSeek, GPT, Claude, etc.).
+
+Supports two extraction modes:
+- **`combined`** (default) — All pages are scraped, content combined, **one** LLM call for extraction. Best for pages that complement each other (e.g. pricing tiers across subpages).
+- **`per_page`** — Each URL is scraped and extracted independently. Best for pages with different structures.
+
+Each mode supports two extraction methods:
+- **Prompt-only** — Describe what to extract in natural language. LLM returns structured JSON automatically.
+- **Schema mode** — Provide a JSON Schema. LLM returns JSON that is validated against the schema.
+
+Supports **synchronous** (`run_async: false`, default) and **async** (`run_async: true`) with polling via `GET /extract/{task_id}`.
+
+#### Request
+
+```json
+{
+  "urls": [
+    "https://example.com/pricing"
+  ],
+  "prompt": "Extract all pricing plans with name, price, billing period, and key features.",
+  "json_schema": {
+    "type": "object",
+    "properties": {
+      "plans": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "price": { "type": "string" },
+            "billing": { "type": "string" },
+            "features": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["name", "price"]
+        }
+      }
+    },
+    "required": ["plans"]
+  },
+  "extract_mode": "combined",
+  "force_js_render": false,
+  "run_async": false
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `urls` | list\[string\] | — | URLs to extract data from *(required, 1–20)* |
+| `prompt` | string | — | Natural-language description of data to extract *(required, 10–2000 chars)* |
+| `json_schema` | object\|null | `null` | JSON Schema to validate the extracted data |
+| `extract_mode` | string | `"combined"` | `"combined"` or `"per_page"` |
+| `force_js_render` | bool | `false` | Use Playwright for all pages (skip Tier-1) |
+| `run_async` | bool | `false` | Run extraction as background task |
+
+#### Response (Sync Mode)
+
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "url": "https://example.com/pricing",
+      "extraction": {
+        "plans": [
+          {
+            "name": "Starter",
+            "price": "$19/mo",
+            "billing": "monthly",
+            "features": ["5 projects", "10 GB storage"]
+          },
+          {
+            "name": "Pro",
+            "price": "$49/mo",
+            "billing": "monthly",
+            "features": ["Unlimited projects", "100 GB storage"]
+          }
+        ]
+      },
+      "error": null
+    }
+  ],
+  "total_urls": 1,
+  "failed_urls": 0,
+  "extract_mode": "combined",
+  "task_id": null
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `success` | `true` if all URLs extracted successfully |
+| `data[].url` | URL that was extracted |
+| `data[].extraction` | Extracted data in JSON format (null if failed) |
+| `data[].error` | Error message if extraction failed for this URL |
+| `total_urls` | Total URLs processed |
+| `failed_urls` | Number of URLs that failed |
+| `extract_mode` | Mode used (`combined` or `per_page`) |
+| `task_id` | Background task ID (only when `run_async: true`) |
+
+### `GET /api/v1/extract/{task_id}`
+
+Poll for the result of a background extraction task (used with `run_async: true`).
+
+| `status` | Meaning |
+|----------|---------|
+| `processing` | Task is still being processed |
+| `done` | Task is ready — `success`, `data`, `total_urls`, `failed_urls`, `extract_mode` populated |
+| `error` | Task failed |
+| `not_found` | Task ID not found or expired |
+
 ### `GET /health`
 
 ```json
@@ -407,7 +536,7 @@ Exposes Prometheus metrics (OpenMetrics format).
 | `SEARXNG_CATEGORIES` | `web,news` | SearXNG search categories (comma-separated). Default excludes videos, images, and files. |
 | `CMD_API_KEY` | — | API key for AI summarization *(required)* |
 | `CMD_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible API base URL |
-| `CMD_MODEL` | `deepseek/deepseek-chat` | Model name for summarization |
+| `CMD_MODEL` | `deepseek/deepseek-chat` | Model name for AI (OpenAI-compatible format) |
 | `PLAYWRIGHT_BROWSER_PATH` | *(auto)* | Custom Chromium binary path |
 | `BROWSER_POOL_SIZE` | `2` | Number of Chromium instances (round-robin) |
 | `HOST` | `0.0.0.0` | Server host binding |
@@ -426,6 +555,11 @@ Exposes Prometheus metrics (OpenMetrics format).
 | `CRAWL_DELAY_MS` | `500` | Per-page delay in milliseconds |
 | `MAP_MAX_CONCURRENT` | `10` | Max concurrent requests during map discovery |
 | `MAP_DELAY_MS` | `200` | Per-page delay during map discovery (milliseconds) |
+| `EXTRACT_MAX_URLS` | `20` | Max URLs per extraction request |
+| `EXTRACT_MAX_PROMPT_LENGTH` | `2000` | Max prompt characters |
+| `EXTRACT_MAX_CONTENT_CHARS` | `8000` | Max content chars per URL sent to LLM |
+| `EXTRACT_TEMPERATURE` | `0.1` | LLM temperature (lower = more deterministic) |
+| `EXTRACT_RETRIES` | `1` | Retries if LLM returns invalid JSON (schema mode) |
 
 ---
 
@@ -529,6 +663,51 @@ curl -X POST http://localhost:8000/api/v1/map \
 
 # Poll for async map result
 curl http://localhost:8000/api/v1/map/{task_id}
+
+# ── Structured Data Extraction ──────────────────
+
+# Quick extraction — quotes.toscrape.com (prompt-only)
+curl -X POST http://localhost:8000/api/v1/extract \
+  -H "Content-Type: application/json" \
+  -d '{"urls": ["http://quotes.toscrape.com"], "prompt": "Extract all quotes with their text and author"}'
+
+# Extraction with JSON Schema — books.toscrape.com (validated output)
+curl -X POST http://localhost:8000/api/v1/extract \
+  -H "Content-Type: application/json" \
+  -d '{
+    "urls": ["http://books.toscrape.com"],
+    "prompt": "Extract all books with title and price",
+    "json_schema": {
+      "type": "object",
+      "properties": {
+        "books": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {"type": "string"},
+              "price": {"type": "string"}
+            },
+            "required": ["title", "price"]
+          }
+        }
+      },
+      "required": ["books"]
+    }
+  }'
+
+# Multi-URL per_page — two different sites
+curl -X POST http://localhost:8000/api/v1/extract \
+  -H "Content-Type: application/json" \
+  -d '{"urls": ["http://quotes.toscrape.com", "http://books.toscrape.com"], "prompt": "Extract the page title and summary", "extract_mode": "per_page"}'
+
+# Async extraction (returns task_id immediately)
+curl -X POST http://localhost:8000/api/v1/extract \
+  -H "Content-Type: application/json" \
+  -d '{"urls": ["http://quotes.toscrape.com"], "prompt": "Extract all quotes with text and author", "run_async": true}'
+
+# Poll for async extraction result
+curl http://localhost:8000/api/v1/extract/{task_id}
 ```
 
 ---

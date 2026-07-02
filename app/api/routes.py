@@ -3,7 +3,8 @@ API Route Handlers
 
 Defines /api/v1/research, /api/v1/research/{task_id},
 /api/v1/crawl, /api/v1/crawl/{task_id},
-/api/v1/map, and /api/v1/map/{task_id} endpoints.
+/api/v1/map, /api/v1/map/{task_id},
+/api/v1/extract, and /api/v1/extract/{task_id} endpoints.
 Protected by circuit breaker (SearXNG) and rate limiting (slowapi).
 Supports both synchronous and async (background) execution modes via run_async flag.
 Distributes scraping across browser pool (round-robin).
@@ -12,7 +13,8 @@ Instrumented with Prometheus metrics for observability.
 
 import asyncio
 
-from fastapi import APIRouter, Request
+import jsonschema
+from fastapi import APIRouter, HTTPException, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -22,6 +24,10 @@ from app.models.schemas import (
     CrawlRequest,
     CrawlResponse,
     CrawlTaskStatusResponse,
+    ExtractData,
+    ExtractRequest,
+    ExtractResponse,
+    ExtractTaskStatusResponse,
     MapRequest,
     MapResponse,
     MapTaskStatusResponse,
@@ -31,7 +37,7 @@ from app.models.schemas import (
     ScrapeResult,
     TaskStatusResponse,
 )
-from app.services import crawler, discovery, scraper, searxng, summarizer
+from app.services import crawler, discovery, extractor, scraper, searxng, summarizer
 from app.utils.circuit_breaker import CircuitBreakerOpenError
 from app.utils.helpers import get_logger
 from app.utils.task_store import task_store
@@ -814,3 +820,187 @@ async def get_map_task_status(task_id: str) -> MapTaskStatusResponse:
         )
 
     return MapTaskStatusResponse(task_id=task_id, status=task["status"])
+
+
+# ── Structured Data Extraction ──────────────────────────────────────────
+
+
+@router.post("/extract", response_model=ExtractResponse)
+@limiter.limit(settings.crawl_rate_limit)
+async def extract_endpoint(
+    request: Request, payload: ExtractRequest
+) -> ExtractResponse:
+    """
+    Extract structured data from one or more URLs using an OpenAI-compatible LLM.
+
+    Supports two extraction modes:
+    - **combined** (default): All pages scraped, content combined, one LLM extraction.
+    - **per_page**: Each page scraped and extracted independently.
+
+    Each mode supports:
+    - **Prompt-only**: Describe what to extract in natural language.
+    - **Schema mode**: Provide a JSON Schema for validated extraction.
+
+    Supports async mode via run_async=True — poll with GET /api/v1/extract/{task_id}.
+    """
+    logger.info(
+        "Extract request received",
+        extra={
+            "url_count": len(payload.urls),
+            "urls": payload.urls[:5],
+            "mode": payload.extract_mode,
+            "has_schema": payload.json_schema is not None,
+            "run_async": payload.run_async,
+        },
+    )
+
+    # Validate schema if provided
+    if payload.json_schema is not None:
+        try:
+            jsonschema.Draft7Validator.check_schema(payload.json_schema)
+        except jsonschema.SchemaError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid JSON Schema: {exc}",
+            )
+
+    # ── Async Mode ──────────────────────────────────
+    if payload.run_async:
+        task_id = task_store.create(str(payload.urls))
+        logger.info(
+            "Starting background extraction",
+            extra={"task_id": task_id, "url_count": len(payload.urls)},
+        )
+        asyncio.create_task(
+            _run_extract_background(
+                task_id=task_id,
+                payload=payload,
+                http_client=request.app.state.http_client,
+                browsers=request.app.state.playwright_browsers,
+            )
+        )
+        return ExtractResponse(
+            success=False,
+            data=[],
+            total_urls=0,
+            extract_mode=payload.extract_mode,
+            task_id=task_id,
+        )
+
+    # ── Sync Mode ──────────────────────────────────
+    http_client = request.app.state.http_client
+    browsers = request.app.state.playwright_browsers
+
+    try:
+        data_list, failed = await extractor.run_extraction(
+            urls=payload.urls,
+            prompt=payload.prompt,
+            schema=payload.json_schema,
+            extract_mode=payload.extract_mode,
+            force_js_render=payload.force_js_render,
+            http_client=http_client,
+            browsers=browsers,
+        )
+    except Exception as exc:
+        logger.error("Extraction failed", extra={"error": str(exc)})
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {exc}")
+
+    return ExtractResponse(
+        success=failed == 0,
+        data=data_list,
+        total_urls=len(payload.urls),
+        failed_urls=failed,
+        extract_mode=payload.extract_mode,
+    )
+
+
+async def _run_extract_background(
+    task_id: str,
+    payload: ExtractRequest,
+    http_client,
+    browsers,
+) -> None:
+    """Background task: execute extraction pipeline and store result in task_store."""
+    try:
+        data_list, failed = await extractor.run_extraction(
+            urls=payload.urls,
+            prompt=payload.prompt,
+            schema=payload.json_schema,
+            extract_mode=payload.extract_mode,
+            force_js_render=payload.force_js_render,
+            http_client=http_client,
+            browsers=browsers,
+        )
+
+        result_data = [
+            {"url": d.url, "extraction": d.extraction, "error": d.error}
+            for d in data_list
+        ]
+
+        task_store.complete(
+            task_id,
+            {
+                "success": failed == 0,
+                "data": result_data,
+                "total_urls": len(payload.urls),
+                "failed_urls": failed,
+                "extract_mode": payload.extract_mode,
+            },
+        )
+
+        logger.info(
+            "Background extraction complete",
+            extra={
+                "task_id": task_id,
+                "total_urls": len(payload.urls),
+                "failed": failed,
+            },
+        )
+
+    except Exception as exc:
+        error_msg = str(exc)
+        task_store.fail(task_id, error_msg)
+        logger.error(
+            "Background extraction failed",
+            extra={"task_id": task_id, "error": error_msg},
+        )
+
+
+@router.get("/extract/{task_id}")
+async def get_extract_task_status(task_id: str) -> ExtractTaskStatusResponse:
+    """
+    Poll for the result of a background extraction task (run_async=true).
+
+    Returns:
+        - status="processing": task is still running
+        - status="done": result is ready (success, data, total_urls, failed_urls, extract_mode)
+        - status="error": task failed
+        - status="not_found": task_id not found or expired
+    """
+    task = task_store.get(task_id)
+
+    if task is None:
+        return ExtractTaskStatusResponse(task_id=task_id, status="not_found")
+
+    if task["status"] == "done":
+        result = task["result"]
+        if isinstance(result, dict):
+            raw_data = result.get("data", [])
+            data_list = [ExtractData(**d) for d in raw_data]
+            return ExtractTaskStatusResponse(
+                task_id=task_id,
+                status="done",
+                success=result.get("success"),
+                data=data_list,
+                total_urls=result.get("total_urls"),
+                failed_urls=result.get("failed_urls"),
+                extract_mode=result.get("extract_mode"),
+            )
+
+    if task["status"] == "error":
+        return ExtractTaskStatusResponse(
+            task_id=task_id,
+            status="error",
+        )
+
+    return ExtractTaskStatusResponse(task_id=task_id, status=task["status"])

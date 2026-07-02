@@ -2,10 +2,7 @@
 Recursive Crawl Engine (BFS)
 
 Performs breadth-first multi-page crawl starting from a seed URL.
-Reuses the existing Two-Tier scraping primitives from ``app.services.scraper``:
-- ``_fetch_static``  — Tier-1 (httpx)
-- ``_fetch_dynamic`` — Tier-2 (Playwright)
-- ``_extract_markdown`` — HTML → Markdown
+Reuses the Two-Tier scraping from ``app.services.scraper.fetch_and_extract``.
 
 Link extraction is delegated to ``app.utils.links.extract_internal_links``.
 
@@ -13,21 +10,16 @@ Architecture::
 
     seed URL → BFS queue (depth-by-depth batches)
                 │
-                ├─ _scrape_page_and_extract_links()  ← Two-Tier
-                │    └─ returns raw_html + markdown
+                ├─ fetch_and_extract()             ← Two-Tier (scraper)
+                │    └─ returns markdown + raw_html
                 │
                 ├─ extract_internal_links(html)  → child URLs
                 │
                 └─ enqueue children → next depth batch
-
-Concurrency is gated by two nested semaphores:
-- ``crawl_semaphore`` (total concurrent scrapes per crawl)
-- ``playwright_semaphore`` (concurrent Playwright contexts; Tier-2 only)
 """
 
 import asyncio
 import itertools
-import time
 from collections import deque
 from typing import Any, cast
 
@@ -35,105 +27,11 @@ import httpx
 from playwright.async_api import Browser
 
 from app.config import settings
-from app.services.scraper import _extract_markdown, _fetch_dynamic, _fetch_static
+from app.services.scraper import fetch_and_extract
 from app.utils.helpers import get_logger
 from app.utils.links import extract_internal_links, normalize_url
 
 logger = get_logger(__name__)
-
-# Per-depth delay (seconds) — applied once at the start of each depth batch,
-# not between every individual page.  This is a gentler rate-limit that still
-# prevents hammering the target server.
-_DEPTH_BATCH_DELAY: float = 1.0
-
-
-async def _scrape_page_and_extract_links(
-    url: str,
-    browser: Browser,
-    client: httpx.AsyncClient,
-    *,
-    force_js_render: bool = False,
-    playwright_semaphore: asyncio.Semaphore | None = None,
-) -> dict[str, Any]:
-    """
-    Fetch a single page using the Two-Tier strategy and return both
-    Markdown and raw HTML.
-
-    Tier-1 (httpx) is tried first.  If it returns no HTML, Tier-2
-    (Playwright) is used as fallback.  If *force_js_render* is True,
-    Tier-1 is skipped entirely.
-
-    Returns a dict with keys:
-        url, fetch_method, markdown_content, title, content_length,
-        raw_html (for link extraction), error
-    """
-    start = time.monotonic()
-
-    result: dict[str, Any] = {
-        "url": url,
-        "fetch_method": "unknown",
-        "markdown_content": "",
-        "title": None,
-        "content_length": 0,
-        "raw_html": None,
-        "error": None,
-    }
-
-    html: str | None = None
-    error: str | None = None
-
-    # ── Tier 1: Static (httpx) ─────────────────────────────────────
-    if not force_js_render:
-        html, error = await _fetch_static(url, client)
-        if html is not None:
-            result["fetch_method"] = "httpx"
-            logger.debug("Crawl Tier-1 success", extra={"url": url})
-
-    # ── Tier 2: Dynamic (Playwright) ───────────────────────────────
-    if html is None:
-        if playwright_semaphore is not None:
-            async with playwright_semaphore:
-                html, error = await _fetch_dynamic(url, browser)
-        else:
-            html, error = await _fetch_dynamic(url, browser)
-
-        if html is not None:
-            result["fetch_method"] = "playwright"
-            logger.debug("Crawl Tier-2 success", extra={"url": url})
-        else:
-            result["fetch_method"] = "playwright-failed"
-            result["error"] = error or "Both Tier-1 and Tier-2 returned no HTML"
-            elapsed = time.monotonic() - start
-            logger.warning(
-                "Crawl page FAILED",
-                extra={
-                    "url": url,
-                    "error": result["error"],
-                    "duration_ms": int(elapsed * 1000),
-                },
-            )
-            return result
-
-    # ── Extract Markdown & store raw HTML ──────────────────────────
-    if html is not None:
-        markdown = _extract_markdown(html)
-        result["markdown_content"] = markdown
-        result["content_length"] = len(markdown)
-        result["raw_html"] = html
-        result["error"] = None
-
-        elapsed = time.monotonic() - start
-        logger.info(
-            "Crawl page scraped",
-            extra={
-                "url": url,
-                "method": result["fetch_method"],
-                "content_length": result["content_length"],
-                "duration_ms": int(elapsed * 1000),
-            },
-        )
-
-    return result
 
 
 async def crawl(
@@ -177,7 +75,9 @@ async def crawl(
 
     # ── Semaphores ─────────────────────────────────────────────────
     crawl_semaphore = asyncio.Semaphore(settings.crawl_max_concurrent)
-    playwright_semaphore = asyncio.Semaphore(3)  # cap Playwright contexts
+    playwright_semaphore = asyncio.Semaphore(
+        settings.crawl_playwright_concurrency
+    )  # cap Playwright contexts
 
     # Browser pool (round-robin)
     pool = itertools.cycle(browsers)
@@ -219,7 +119,7 @@ async def crawl(
 
         # ── Optional inter-depth delay (rate limiting) ─────────────
         if current_depth > 0:
-            await asyncio.sleep(_DEPTH_BATCH_DELAY)
+            await asyncio.sleep(settings.crawl_depth_delay)
 
         # ── Define per-page processor ──────────────────────────────
         async def _process_one(url: str, depth: int) -> dict[str, Any]:
@@ -228,12 +128,14 @@ async def crawl(
                 if settings.crawl_delay_ms > 0:
                     await asyncio.sleep(settings.crawl_delay_ms / 1000.0)
 
-                page = await _scrape_page_and_extract_links(
+                # Use shared fetch_and_extract with raw_html for link extraction
+                page = await fetch_and_extract(
                     url,
                     next(pool),
                     http_client,
                     force_js_render=force_js_render,
-                    playwright_semaphore=playwright_semaphore,
+                    semaphore=playwright_semaphore,
+                    include_raw_html=True,
                 )
 
                 # ── Extract links from raw HTML ────────────────────

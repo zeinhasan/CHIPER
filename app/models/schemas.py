@@ -4,7 +4,7 @@ Pydantic models for CHIPER API request/response validation.
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ResearchRequest(BaseModel):
@@ -64,6 +64,7 @@ class TaskStatusResponse(BaseModel):
     status: str  # "processing", "done", "error", "not_found"
     query: str | None = None
     ai_summary: str | None = None
+    error: str | None = None
     results: list[ScrapeResult] | None = None
     total_results: int | None = None
 
@@ -80,6 +81,21 @@ class CrawlRequest(BaseModel):
         max_length=2048,
         description="Starting URL to crawl.",
     )
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("URL cannot be empty")
+        v = v.strip()
+        if "://" not in v:
+            v = "https://" + v
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("URL must start with http:// or https://")
+        if len(v) > 2048:
+            raise ValueError("URL too long (max 2048 characters)")
+        return v
+
     max_depth: int = Field(
         default=3,
         ge=1,
@@ -141,6 +157,7 @@ class CrawlTaskStatusResponse(BaseModel):
     base_url: str | None = None
     total_pages: int | None = None
     ai_summary: str | None = None
+    error: str | None = None
     results: list[CrawlPage] | None = None
 
 
@@ -156,6 +173,21 @@ class MapRequest(BaseModel):
         max_length=2048,
         description="Base URL to discover.",
     )
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("URL cannot be empty")
+        v = v.strip()
+        if "://" not in v:
+            v = "https://" + v
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("URL must start with http:// or https://")
+        if len(v) > 2048:
+            raise ValueError("URL too long (max 2048 characters)")
+        return v
+
     discovery_method: Literal["sitemap", "crawl", "hybrid"] = Field(
         default="hybrid",
         description="Method: 'sitemap' (parse sitemap.xml only), "
@@ -225,6 +257,7 @@ class MapTaskStatusResponse(BaseModel):
     status: str  # "processing", "done", "error", "not_found"
     base_url: str | None = None
     total_urls: int | None = None
+    error: str | None = None
     urls: list[MapUrl] | None = None
     sitemap_url: str | None = None
     discovery_method: str | None = None
@@ -244,6 +277,25 @@ class ExtractRequest(BaseModel):
         max_length=20,
         description="List of URLs to extract data from (1-20).",
     )
+
+    @field_validator("urls")
+    @classmethod
+    def _validate_urls(cls, v: list[str]) -> list[str]:
+        for i, url in enumerate(v):
+            if not url or not url.strip():
+                raise ValueError(f"URL at index {i} cannot be empty")
+            url = url.strip()
+            if "://" not in url:
+                url = "https://" + url
+            if not url.startswith(("http://", "https://")):
+                raise ValueError(
+                    f"URL at index {i} must start with http:// or https://"
+                )
+            if len(url) > 2048:
+                raise ValueError(f"URL at index {i} too long (max 2048 characters)")
+            v[i] = url
+        return v
+
     prompt: str = Field(
         ...,
         min_length=10,
@@ -298,3 +350,4 @@ class ExtractTaskStatusResponse(BaseModel):
     total_urls: int | None = None
     failed_urls: int | None = None
     extract_mode: str | None = None
+    error: str | None = None

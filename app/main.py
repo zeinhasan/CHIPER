@@ -14,12 +14,14 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import Browser, async_playwright
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from app.api.routes import limiter, router
 from app.config import settings
+from app.middleware.auth import ApiKeyMiddleware
 from app.middleware.tracing import TracingMiddleware
 from app.utils.circuit_breaker import CircuitBreaker
 from app.utils.logging import get_logger, setup_logging
@@ -39,14 +41,21 @@ async def lifespan(app: FastAPI):
 
     # --- Startup ---
     setup_logging()
-    logger.info("CHIPER v1.3.0 starting up...")
+    logger.info("CHIPER v1.4.1 starting up...")
 
     # Shared httpx client (connection pool reuse)
     app.state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(20.0),
-        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        limits=httpx.Limits(
+            max_connections=20,
+            max_keepalive_connections=10,
+        ),
     )
-    logger.info("Shared httpx.AsyncClient created (pool: 20 conn, 10 keepalive).")
+    logger.info(
+        "Shared httpx.AsyncClient created "
+        "(pool: 20 conn, 10 keepalive, max_body: %d MB).",
+        settings.scrape_max_body_mb,
+    )
 
     # Circuit breaker for SearXNG
     app.state.searxng_circuit = CircuitBreaker(
@@ -102,12 +111,34 @@ app = FastAPI(
         "Middleware API that bridges AI agents with SearXNG for web research "
         "and content extraction, with optional AI summarization via DeepSeek."
     ),
-    version="1.3.0",
+    version="1.4.1",
     lifespan=lifespan,
 )
 
 # --- Middleware ---
 app.add_middleware(TracingMiddleware)
+
+# API Key Authentication (disabled when CHIPER_API_KEY is empty)
+app.add_middleware(ApiKeyMiddleware)
+
+# CORS — only add if explicitly configured (empty = no CORS)
+if settings.chiper_cors_origins:
+    origins = [o.strip() for o in settings.chiper_cors_origins.split(",") if o.strip()]
+    if "*" in origins:
+        logger.warning(
+            "CORS allow_origins contains '*'.  This allows ANY website "
+            "to call the API from a browser.  Consider restricting to "
+            "specific origins in production via CHIPER_CORS_ORIGINS."
+        )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_methods=["GET", "POST"],
+        allow_headers=["X-API-Key", "X-Request-ID", "Content-Type"],
+    )
+    logger.info("CORS enabled for origins: %s", origins)
+else:
+    logger.info("CORS disabled (CHIPER_CORS_ORIGINS is empty).")
 
 # --- Rate Limiting ---
 app.state.limiter = limiter
@@ -123,7 +154,7 @@ app.include_router(router)
 @app.get("/health", tags=["system"])
 async def health_check() -> dict:
     """Simple health-check endpoint."""
-    return {"status": "ok", "version": "1.3.0"}
+    return {"status": "ok", "version": "1.4.1"}
 
 
 # --- Direct run (development) ---

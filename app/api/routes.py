@@ -40,9 +40,24 @@ from app.models.schemas import (
 from app.services import crawler, discovery, extractor, scraper, searxng, summarizer
 from app.utils.circuit_breaker import CircuitBreakerOpenError
 from app.utils.helpers import get_logger
+from app.utils.security import validate_url_safe
 from app.utils.task_store import task_store
 
 logger = get_logger(__name__)
+
+# Generic error messages for API responses (never leak internal details).
+_ERR_INTERNAL = "An internal error occurred. Check server logs for details."
+_ERR_SSRF = "URL points to an internal/private address and was blocked."
+_ERR_TASK_LIMIT = "Too many concurrent tasks. Please try again later."
+
+
+def _create_task_safe(query: str | None = None) -> str:
+    """Create a background task, raising HTTP 429 if limit reached."""
+    try:
+        return task_store.create(query)
+    except RuntimeError:
+        raise HTTPException(status_code=429, detail=_ERR_TASK_LIMIT)
+
 
 # Domains that are video/image/media platforms and not scrapable for text research.
 # These are filtered out before scraping to avoid wasting resources.
@@ -112,7 +127,7 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
 
     # ── Async Mode: run entire pipeline in background ──────────────
     if payload.run_async:
-        task_id = task_store.create(payload.query)
+        task_id = _create_task_safe(payload.query)
         logger.info(
             "Starting background full-research pipeline",
             extra={"task_id": task_id, "query": payload.query},
@@ -224,7 +239,7 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
                 ai_summary = await summarizer.summarize(documents, payload.query)
             except Exception as exc:
                 logger.error("Summarization failed", extra={"error": str(exc)})
-                ai_summary = f"Summarization failed: {exc}"
+                ai_summary = _ERR_INTERNAL
 
             logger.info(
                 "Research complete (with summary)",
@@ -285,7 +300,7 @@ async def _run_full_research(
             return
         except RuntimeError as exc:
             logger.error("SearXNG stage failed: %s", exc)
-            task_store.fail(task_id, str(exc))
+            task_store.fail(task_id, _ERR_INTERNAL)
             return
 
         if not search_results:
@@ -347,7 +362,7 @@ async def _run_full_research(
                     "Summarization failed in background",
                     extra={"task_id": task_id, "error": str(exc)},
                 )
-                ai_summary = f"Summarization failed: {exc}"
+                ai_summary = _ERR_INTERNAL
 
         success_count = sum(1 for r in results if r["content_length"] > 0)
         logger.info(
@@ -371,11 +386,10 @@ async def _run_full_research(
         )
 
     except Exception as exc:
-        error_msg = str(exc)
-        task_store.fail(task_id, error_msg)
+        task_store.fail(task_id, _ERR_INTERNAL)
         logger.error(
             "Background full-research failed",
-            extra={"task_id": task_id, "error": error_msg},
+            extra={"task_id": task_id, "error": str(exc)},
         )
 
 
@@ -387,7 +401,7 @@ async def get_task_status(task_id: str):
     Returns:
         - status="processing": task is still running
         - status="done": result is ready (query, results, total_results, ai_summary populated)
-        - status="error": task failed (ai_summary contains error message)
+        - status="error": task failed (error field contains error message)
         - status="not_found": task_id not found or expired
     """
     task = task_store.get(task_id)
@@ -425,7 +439,7 @@ async def get_task_status(task_id: str):
         return TaskStatusResponse(
             task_id=task_id,
             status="error",
-            ai_summary=task["result"],
+            error=str(task["result"]) if task["result"] else "Unknown error",
         )
 
     return TaskStatusResponse(
@@ -461,9 +475,13 @@ async def crawl_endpoint(request: Request, payload: CrawlRequest) -> CrawlRespon
         },
     )
 
+    # ── SSRF check ───────────────────────────────────────────────
+    if validate_url_safe(payload.url) is None:
+        raise HTTPException(status_code=400, detail=_ERR_SSRF)
+
     # ── Async Mode ────────────────────────────────────────────────
     if payload.run_async:
-        task_id = task_store.create(payload.url)
+        task_id = _create_task_safe(payload.url)
         logger.info(
             "Starting background crawl", extra={"task_id": task_id, "url": payload.url}
         )
@@ -483,16 +501,29 @@ async def crawl_endpoint(request: Request, payload: CrawlRequest) -> CrawlRespon
     http_client = request.app.state.http_client
     browsers = request.app.state.playwright_browsers
 
-    crawl_results = await crawler.crawl(
-        seed_url=payload.url,
-        max_depth=payload.max_depth,
-        max_pages=payload.max_pages,
-        include_paths=payload.include_paths,
-        exclude_paths=payload.exclude_paths,
-        force_js_render=payload.force_js_render,
-        http_client=http_client,
-        browsers=browsers,
-    )
+    try:
+        crawl_results = await asyncio.wait_for(
+            crawler.crawl(
+                seed_url=payload.url,
+                max_depth=payload.max_depth,
+                max_pages=payload.max_pages,
+                include_paths=payload.include_paths,
+                exclude_paths=payload.exclude_paths,
+                force_js_render=payload.force_js_render,
+                http_client=http_client,
+                browsers=browsers,
+            ),
+            timeout=settings.crawl_total_timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Crawl timed out",
+            extra={"url": payload.url, "timeout": settings.crawl_total_timeout},
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=f"Crawl timed out after {settings.crawl_total_timeout:.0f}s",
+        )
 
     # ── Optional AI Summarization ──────────────────────────────────
     ai_summary: str | None = None
@@ -509,7 +540,7 @@ async def crawl_endpoint(request: Request, payload: CrawlRequest) -> CrawlRespon
                 ai_summary = await summarizer.summarize(documents, payload.url)
             except Exception as exc:
                 logger.error("Crawl summarization failed", extra={"error": str(exc)})
-                ai_summary = f"Summarization failed: {exc}"
+                ai_summary = _ERR_INTERNAL
 
     pages = [
         CrawlPage(
@@ -569,8 +600,8 @@ async def _run_crawl_background(
             if documents:
                 try:
                     ai_summary = await summarizer.summarize(documents, payload.url)
-                except Exception as exc:
-                    ai_summary = f"Summarization failed: {exc}"
+                except Exception:
+                    ai_summary = _ERR_INTERNAL
 
         pages = [
             {
@@ -601,11 +632,10 @@ async def _run_crawl_background(
         )
 
     except Exception as exc:
-        error_msg = str(exc)
-        task_store.fail(task_id, error_msg)
+        task_store.fail(task_id, _ERR_INTERNAL)
         logger.error(
             "Background crawl failed",
-            extra={"task_id": task_id, "error": error_msg},
+            extra={"task_id": task_id, "error": str(exc)},
         )
 
 
@@ -617,7 +647,7 @@ async def get_crawl_task_status(task_id: str) -> CrawlTaskStatusResponse:
     Returns:
         - status="processing": task is still running
         - status="done": result is ready (base_url, total_pages, results, ai_summary)
-        - status="error": task failed (ai_summary contains error message)
+        - status="error": task failed (error field contains error message)
         - status="not_found": task_id not found or expired
     """
     task = task_store.get(task_id)
@@ -643,7 +673,7 @@ async def get_crawl_task_status(task_id: str) -> CrawlTaskStatusResponse:
         return CrawlTaskStatusResponse(
             task_id=task_id,
             status="error",
-            ai_summary=task["result"],  # error message stored in result
+            error=str(task["result"]) if task["result"] else "Unknown error",
         )
 
     return CrawlTaskStatusResponse(task_id=task_id, status=task["status"])
@@ -676,9 +706,13 @@ async def map_endpoint(request: Request, payload: MapRequest) -> MapResponse:
         },
     )
 
+    # ── SSRF check ───────────────────────────────────────────────
+    if validate_url_safe(payload.url) is None:
+        raise HTTPException(status_code=400, detail=_ERR_SSRF)
+
     # ── Async Mode ────────────────────────────────────────────────
     if payload.run_async:
-        task_id = task_store.create(payload.url)
+        task_id = _create_task_safe(payload.url)
         logger.info(
             "Starting background map discovery",
             extra={"task_id": task_id, "url": payload.url},
@@ -700,17 +734,30 @@ async def map_endpoint(request: Request, payload: MapRequest) -> MapResponse:
 
     # ── Sync Mode ─────────────────────────────────────────────────
     client = request.app.state.http_client
-    result = await discovery.run_discovery(
-        url=payload.url,
-        discovery_method=payload.discovery_method,
-        max_urls=payload.max_urls,
-        max_depth=payload.max_depth,
-        include_paths=payload.include_paths,
-        exclude_paths=payload.exclude_paths,
-        include_subdomains=payload.include_subdomains,
-        ignore_query_params=payload.ignore_query_params,
-        client=client,
-    )
+    try:
+        result = await asyncio.wait_for(
+            discovery.run_discovery(
+                url=payload.url,
+                discovery_method=payload.discovery_method,
+                max_urls=payload.max_urls,
+                max_depth=payload.max_depth,
+                include_paths=payload.include_paths,
+                exclude_paths=payload.exclude_paths,
+                include_subdomains=payload.include_subdomains,
+                ignore_query_params=payload.ignore_query_params,
+                client=client,
+            ),
+            timeout=settings.map_total_timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Map discovery timed out",
+            extra={"url": payload.url, "timeout": settings.map_total_timeout},
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=f"Map discovery timed out after {settings.map_total_timeout:.0f}s",
+        )
 
     urls = [MapUrl(**u) for u in result["urls"]]
 
@@ -771,11 +818,10 @@ async def _run_map_background(
         )
 
     except Exception as exc:
-        error_msg = str(exc)
-        task_store.fail(task_id, error_msg)
+        task_store.fail(task_id, _ERR_INTERNAL)
         logger.error(
             "Background map discovery failed",
-            extra={"task_id": task_id, "error": error_msg},
+            extra={"task_id": task_id, "error": str(exc)},
         )
 
 
@@ -787,7 +833,7 @@ async def get_map_task_status(task_id: str) -> MapTaskStatusResponse:
     Returns:
         - status="processing": task is still running
         - status="done": result is ready (base_url, total_urls, urls, etc.)
-        - status="error": task failed (base_url contains error message)
+        - status="error": task failed (error field contains error message)
         - status="not_found": task_id not found or expired
     """
     task = task_store.get(task_id)
@@ -816,7 +862,7 @@ async def get_map_task_status(task_id: str) -> MapTaskStatusResponse:
         return MapTaskStatusResponse(
             task_id=task_id,
             status="error",
-            base_url=task["result"],  # error message stored in result
+            error=str(task["result"]) if task["result"] else "Unknown error",
         )
 
     return MapTaskStatusResponse(task_id=task_id, status=task["status"])
@@ -854,11 +900,27 @@ async def extract_endpoint(
         },
     )
 
+    # ── SSRF check (validate all URLs) ───────────────────────────
+    unsafe_urls = [u for u in payload.urls if validate_url_safe(u) is None]
+    if unsafe_urls:
+        logger.warning(
+            "SSRF blocked URLs",
+            extra={"count": len(unsafe_urls), "urls": unsafe_urls[:3]},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"{_ERR_SSRF} ({len(unsafe_urls)} URL(s) blocked)",
+        )
+
     # Validate schema if provided
     if payload.json_schema is not None:
         try:
             jsonschema.Draft7Validator.check_schema(payload.json_schema)
         except jsonschema.SchemaError as exc:
+            logger.warning(
+                "Invalid JSON Schema received",
+                extra={"error": str(exc), "urls": payload.urls[:3]},
+            )
             raise HTTPException(
                 status_code=422,
                 detail=f"Invalid JSON Schema: {exc}",
@@ -866,7 +928,7 @@ async def extract_endpoint(
 
     # ── Async Mode ──────────────────────────────────
     if payload.run_async:
-        task_id = task_store.create(str(payload.urls))
+        task_id = _create_task_safe(str(payload.urls))
         logger.info(
             "Starting background extraction",
             extra={"task_id": task_id, "url_count": len(payload.urls)},
@@ -903,7 +965,7 @@ async def extract_endpoint(
         )
     except Exception as exc:
         logger.error("Extraction failed", extra={"error": str(exc)})
-        raise HTTPException(status_code=500, detail=f"Extraction failed: {exc}")
+        raise HTTPException(status_code=500, detail=_ERR_INTERNAL)
 
     return ExtractResponse(
         success=failed == 0,
@@ -958,11 +1020,10 @@ async def _run_extract_background(
         )
 
     except Exception as exc:
-        error_msg = str(exc)
-        task_store.fail(task_id, error_msg)
+        task_store.fail(task_id, _ERR_INTERNAL)
         logger.error(
             "Background extraction failed",
-            extra={"task_id": task_id, "error": error_msg},
+            extra={"task_id": task_id, "error": str(exc)},
         )
 
 
@@ -974,7 +1035,7 @@ async def get_extract_task_status(task_id: str) -> ExtractTaskStatusResponse:
     Returns:
         - status="processing": task is still running
         - status="done": result is ready (success, data, total_urls, failed_urls, extract_mode)
-        - status="error": task failed
+        - status="error": task failed (error field contains error message)
         - status="not_found": task_id not found or expired
     """
     task = task_store.get(task_id)
@@ -1001,6 +1062,7 @@ async def get_extract_task_status(task_id: str) -> ExtractTaskStatusResponse:
         return ExtractTaskStatusResponse(
             task_id=task_id,
             status="error",
+            error=str(task["result"]) if task["result"] else "Unknown error",
         )
 
     return ExtractTaskStatusResponse(task_id=task_id, status=task["status"])

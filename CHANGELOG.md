@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.4.1] — 2026-07-02
+
+### Security
+- **SSRF Prevention** — All user-supplied URLs (`/crawl`, `/map`, `/extract`) are now validated against private/internal IP ranges before any outbound request. Blocks loopback (`127.0.0.0/8`, `::1`), private networks (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`), multicast, and special-use (`0.0.0.0`, TEST-NET, CGNAT). Includes DNS resolution check for hostname-based attacks. (`security.py`, `routes.py`)
+- **API Key Authentication** — New `ApiKeyMiddleware` validates `X-API-Key` header against `CHIPER_API_KEY` env var. Public endpoints (`/health`, `/metrics`) are exempt. Auth is disabled when `CHIPER_API_KEY` is empty (development mode). (`auth.py`, `main.py`, `config.py`)
+- **CORS Configuration** — `CORSMiddleware` added with configurable origins via `CHIPER_CORS_ORIGINS` env var (comma-separated). Empty = CORS disabled. Logs warning if `*` wildcard is used. (`main.py`, `config.py`)
+- **Error Information Disclosure** — All API error responses now use generic messages (`_ERR_INTERNAL`, `_ERR_SSRF`, `_ERR_TASK_LIMIT`) instead of raw exception strings (`str(exc)`). Internal details are preserved in server logs. (`routes.py`)
+- **HTTP Response Body Size Limit** — Content-Length header check added to `_fetch_static()` (scraper) and `_fetch_and_extract_links()` (discovery). Responses exceeding `SCRAPE_MAX_BODY_MB` (default 50MB) are rejected before the body is read, preventing OOM via multi-GB responses. (`scraper.py`, `discovery.py`, `config.py`)
+- **Max Concurrent Background Tasks** — `TaskStore` now tracks inflight task count. When `MAX_INFLIGHT_TASKS` > 0, `create()` raises `RuntimeError` if limit reached. Routes return HTTP 429 via `_create_task_safe()` wrapper. (`task_store.py`, `routes.py`, `config.py`)
+- **Sitemap URL SSRF via robots.txt** — `find_sitemap_url()` now validates that sitemap URLs from `robots.txt` belong to the same domain AND do not resolve to internal/private IPs. (`sitemap.py`)
+- **Operational Timeouts** — Sync crawl and map operations now wrapped with `asyncio.wait_for()`. Timeouts: `CRAWL_TOTAL_TIMEOUT` (default 300s), `MAP_TOTAL_TIMEOUT` (default 120s). Timeout → HTTP 504. (`routes.py`, `config.py`)
+- **LLM Prompt Injection Protection** — User-supplied extraction prompts are now sanitized (XML-style tags removed) and wrapped in `<user_input>...</user_input>` delimiters. System prompt includes explicit boundary instruction to ignore instructions outside the delimiter block. (`extractor.py`)
+
+### Changed
+- **Config cleanup** — Removed unused `EXTRACT_MAX_PROMPT_LENGTH` from `config.py` (validated by Pydantic `Field(max_length=...)` instead).
+- `.env` and `.env.example` updated with all new security-related env vars.
+
+---
+
 ## [1.4.0] — 2026-07-02
 
 ### Added

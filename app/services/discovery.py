@@ -31,10 +31,6 @@ from app.utils.sitemap import find_sitemap_url, parse_sitemap
 
 logger = get_logger(__name__)
 
-# Delay between depth batches (seconds) — gentle rate limiting.
-_DEPTH_BATCH_DELAY: float = 0.5
-
-
 # ────────────────────────────────────────────────────────────────────────
 # Helper: fetch HTML and extract internal links (no content scraping)
 # ────────────────────────────────────────────────────────────────────────
@@ -46,35 +42,58 @@ async def _fetch_and_extract_links(
     include_paths: list[str],
     exclude_paths: list[str],
     include_subdomains: bool,
-) -> tuple[list[str], str | None]:
+) -> tuple[list[str], str | None, str]:
     """
     GET *url*, extract internal same-domain links from the HTML.
 
-    Returns (links, error_message).  On HTTP errors the list is empty
-    and the error string is set.
+    Returns (links, error_message, resolved_url).
+    *resolved_url* is the final URL after following redirects.
+    On HTTP errors the list is empty and the error string is set;
+    resolved_url falls back to the original *url*.
 
-    This is the **lightweight** counterpart of ``_scrape_page_and_extract_links``
+    This is the **lightweight** counterpart of ``fetch_and_extract``
     in the crawl engine — no Playwright, no Markdown, no content extraction.
     """
+    resolved_url = url  # fallback
+    max_body = settings.scrape_max_body_mb * 1024 * 1024
     try:
         resp = await client.get(url, follow_redirects=True)
         resp.raise_for_status()
+        resolved_url = str(resp.url)
+        # ── Body size check ──────────────────────────────────────
+        content_length = resp.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > max_body:
+                    return (
+                        [],
+                        f"Response too large ({content_length} bytes)",
+                        resolved_url,
+                    )
+            except ValueError:
+                pass
     except httpx.HTTPStatusError as exc:
-        return [], f"HTTP {exc.response.status_code}"
+        return [], f"HTTP {exc.response.status_code}", resolved_url
     except Exception as exc:
-        return [], str(exc)
+        return [], str(exc), resolved_url
 
     html = resp.text
     if not html:
-        return [], "Empty response body"
+        return [], "Empty response body", resolved_url
 
-    # ── Extract links ───────────────────────────────────────────────
+    # ── Extract links using the resolved (post-redirect) URL as base ─
     try:
-        links = extract_internal_links(html, url, include_paths, exclude_paths)
+        links = extract_internal_links(
+            html,
+            resolved_url,
+            include_paths,
+            exclude_paths,
+            include_subdomains=include_subdomains,
+        )
     except Exception as exc:
-        return [], f"Link extraction error: {exc}"
+        return [], f"Link extraction error: {exc}", resolved_url
 
-    return links, None
+    return links, None, resolved_url
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -163,7 +182,7 @@ async def discover_crawl(
 
         # ── Inter-depth delay ──────────────────────────────────────
         if current_depth > 0:
-            await asyncio.sleep(_DEPTH_BATCH_DELAY)
+            await asyncio.sleep(settings.map_depth_delay)
 
         # ── Per-page processor ─────────────────────────────────────
         async def _process_one(url: str, depth: int) -> dict[str, Any]:
@@ -171,7 +190,7 @@ async def discover_crawl(
                 if settings.map_delay_ms > 0:
                     await asyncio.sleep(settings.map_delay_ms / 1000.0)
 
-                links, error = await _fetch_and_extract_links(
+                links, error, resolved_url = await _fetch_and_extract_links(
                     url,
                     client,
                     include_paths,
@@ -185,11 +204,11 @@ async def discover_crawl(
                         extra={"url": url, "depth": depth, "error": error},
                     )
 
-                parsed = urlparse(url)
+                parsed = urlparse(resolved_url)
                 path = parsed.path or "/"
 
                 return {
-                    "url": url,
+                    "url": resolved_url,
                     "path": path,
                     "depth": depth,
                     "source": "crawl",
@@ -215,6 +234,8 @@ async def discover_crawl(
             r.pop("_error", None)
 
             results.append(r)
+            # Add resolved URL to visited to prevent re-crawling via redirect chain
+            visited.add(r["url"])
 
             for child_url in links:
                 child_norm = normalize_url(child_url, strip_query=ignore_query_params)
@@ -261,12 +282,18 @@ async def discover_hybrid(
     Hybrid discovery: sitemap first, then crawl to fill remaining capacity.
 
     Returns a dict with keys:
-        urls, sitemap_url, sitemap_count, crawl_count
+        urls, sitemap_url, sitemap_count, crawl_count, discovery_method
     """
     seed_norm = normalize_url(seed_url)
     if not seed_norm:
         logger.error("Invalid seed URL for hybrid discovery", extra={"url": seed_url})
-        return {"urls": [], "sitemap_url": None, "sitemap_count": 0, "crawl_count": 0}
+        return {
+            "urls": [],
+            "sitemap_url": None,
+            "sitemap_count": 0,
+            "crawl_count": 0,
+            "discovery_method": "hybrid",
+        }
 
     # ── Step 1: Sitemap ─────────────────────────────────────────────
     sitemap_url = await find_sitemap_url(client, seed_norm)
@@ -297,6 +324,7 @@ async def discover_hybrid(
             "sitemap_url": sitemap_url,
             "sitemap_count": len(sitemap_results[:max_urls]),
             "crawl_count": 0,
+            "discovery_method": "hybrid",
         }
 
     # ── Step 2: Crawl to fill gaps ──────────────────────────────────
@@ -339,6 +367,7 @@ async def discover_hybrid(
         "sitemap_url": sitemap_url,
         "sitemap_count": len(sitemap_results),
         "crawl_count": len(crawl_results),
+        "discovery_method": "hybrid",
     }
 
 
@@ -465,5 +494,5 @@ async def run_discovery(
                 "duration_ms": int(elapsed * 1000),
             },
         )
-        result["discovery_method"] = "hybrid"
+        result["discovery_method"] = result.get("discovery_method", "hybrid")
         return result

@@ -23,14 +23,18 @@ import httpx
 from app.config import settings
 from app.utils.helpers import get_logger
 from app.utils.links import _is_internal, _matches_filters, normalize_url
+from app.utils.security import is_private_ip
 
 logger = get_logger(__name__)
 
 # XML namespace for standard sitemaps.
 _SITEMAP_NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
 
-# Max sitemap size in bytes before we abort (10 MB).
-_MAX_SITEMAP_SIZE = 10 * 1024 * 1024
+# Max sitemap size in bytes before we abort (50 MB hard limit).
+_MAX_SITEMAP_SIZE = 50 * 1024 * 1024
+
+# Warning threshold — log a warning but still attempt to parse (10 MB).
+_SITEMAP_SIZE_WARNING = 10 * 1024 * 1024
 
 # Max recursion depth for sitemap index traversal.
 _MAX_SITEMAP_INDEX_DEPTH = 3
@@ -88,6 +92,21 @@ async def find_sitemap_url(client: httpx.AsyncClient, base_url: str) -> str | No
             match = _SITEMAP_LINE_RE.search(text)
             if match:
                 sitemap_url = match.group(1).strip()
+                # ── Validate: sitemap URL must be on the same domain ─
+                if not _is_internal(sitemap_url, base_url, include_subdomains=False):
+                    logger.warning(
+                        "Sitemap URL from robots.txt points to external domain — ignored",
+                        extra={"sitemap_url": sitemap_url, "base_url": base_url},
+                    )
+                    return None
+                # ── Also validate: must not point to internal IP (SSRF) ─
+                sitemap_host = urlparse(sitemap_url).hostname or ""
+                if is_private_ip(sitemap_host):
+                    logger.warning(
+                        "Sitemap URL from robots.txt points to internal IP — blocked",
+                        extra={"sitemap_url": sitemap_url},
+                    )
+                    return None
                 logger.info(
                     "Sitemap found via robots.txt",
                     extra={"robots_url": robots_url, "sitemap_url": sitemap_url},
@@ -252,10 +271,15 @@ async def _parse_sitemap_index(
     content_length = len(resp.content)
     if content_length > _MAX_SITEMAP_SIZE:
         logger.warning(
-            "Sitemap index too large — truncating",
+            "Sitemap index too large — aborting",
             extra={"index_url": index_url, "size_bytes": content_length},
         )
         return []
+    elif content_length > _SITEMAP_SIZE_WARNING:
+        logger.warning(
+            "Sitemap index exceeds warning threshold — attempting to parse",
+            extra={"index_url": index_url, "size_bytes": content_length},
+        )
 
     xml_text = _decompress_body(resp.content, resp.headers.get("content-encoding"))
 
@@ -379,12 +403,15 @@ async def parse_sitemap(
     content_length = len(resp.content)
     if content_length > _MAX_SITEMAP_SIZE:
         logger.warning(
-            "Sitemap too large — truncating",
+            "Sitemap too large — aborting",
             extra={"sitemap_url": sitemap_url, "size_bytes": content_length},
         )
-        # Still try to parse — many large sitemaps are indexes with small child files
-        if content_length > 50 * 1024 * 1024:  # 50 MB hard limit
-            return []
+        return []
+    elif content_length > _SITEMAP_SIZE_WARNING:
+        logger.warning(
+            "Sitemap exceeds warning threshold — attempting to parse",
+            extra={"sitemap_url": sitemap_url, "size_bytes": content_length},
+        )
 
     xml_text = _decompress_body(resp.content, resp.headers.get("content-encoding"))
     if not xml_text:

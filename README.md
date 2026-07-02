@@ -556,7 +556,6 @@ Exposes Prometheus metrics (OpenMetrics format).
 | `MAP_MAX_CONCURRENT` | `10` | Max concurrent requests during map discovery |
 | `MAP_DELAY_MS` | `200` | Per-page delay during map discovery (milliseconds) |
 | `EXTRACT_MAX_URLS` | `20` | Max URLs per extraction request |
-| `EXTRACT_MAX_PROMPT_LENGTH` | `2000` | Max prompt characters |
 | `EXTRACT_MAX_CONTENT_CHARS` | `8000` | Max content chars per URL sent to LLM |
 | `EXTRACT_TEMPERATURE` | `0.1` | LLM temperature (lower = more deterministic) |
 | `EXTRACT_RETRIES` | `1` | Retries if LLM returns invalid JSON (schema mode) |

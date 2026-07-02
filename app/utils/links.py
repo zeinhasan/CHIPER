@@ -144,12 +144,14 @@ def extract_internal_links(
     base_url: str,
     include_paths: list[str],
     exclude_paths: list[str],
+    include_subdomains: bool = False,
 ) -> list[str]:
     """
     Extract same-domain internal links from an HTML string.
 
     *html* is the full, raw HTML of the page.
     *base_url* is the URL of the current page (used to resolve relative links).
+    *include_subdomains* if True, subdomains are considered internal.
 
     Only ``<a href="...">`` tags are inspected.  Links with non-HTTP(S)
     schemes (``mailto:``, ``tel:``, ``javascript:``, ``data:``, etc.) and
@@ -191,7 +193,7 @@ def extract_internal_links(
             continue
 
         # ── Only follow same-domain links ──────────────────────────
-        if not _is_internal(full_url, base_url):
+        if not _is_internal(full_url, base_url, include_subdomains=include_subdomains):
             continue
 
         # ── Normalize and filter ───────────────────────────────────

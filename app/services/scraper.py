@@ -134,6 +134,7 @@ async def _fetch_static(
     client: httpx.AsyncClient,
 ) -> tuple[str | None, str | None]:
     """Tier 1: static fetch with retry + backoff."""
+    max_body = settings.scrape_max_body_mb * 1024 * 1024
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -150,6 +151,17 @@ async def _fetch_static(
         try:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
+            # ── Body size check ────────────────────────────────
+            content_length = resp.headers.get("content-length")
+            if content_length:
+                try:
+                    if int(content_length) > max_body:
+                        return (
+                            None,
+                            f"Response too large ({content_length} bytes > {max_body} max)",
+                        )
+                except ValueError:
+                    pass  # Invalid header, proceed
             return resp.text, None
         except httpx.HTTPStatusError as exc:
             if 400 <= exc.response.status_code < 500:
@@ -242,6 +254,7 @@ async def fetch_and_extract(
     *,
     force_js_render: bool = False,
     semaphore: asyncio.Semaphore | None = None,
+    include_raw_html: bool = False,
 ) -> dict:
     """
     Scrape a single URL using the Two-Tier strategy.
@@ -252,9 +265,11 @@ async def fetch_and_extract(
         client: Shared httpx.AsyncClient (connection pool reuse).
         force_js_render: If True, skip Tier 1 entirely.
         semaphore: Optional semaphore to limit concurrent Playwright instances.
+        include_raw_html: If True, include raw HTML in result (for link extraction).
 
     Returns:
         Dict with keys: url, fetch_method, markdown_content, title, content_length, error.
+        If include_raw_html is True, also includes key: raw_html.
     """
     start = time.monotonic()
 
@@ -265,6 +280,7 @@ async def fetch_and_extract(
         "title": None,
         "content_length": 0,
         "error": None,
+        "raw_html": None,
     }
 
     # --- Tier 1: Static (httpx) ---
@@ -283,6 +299,8 @@ async def fetch_and_extract(
                 result["markdown_content"] = markdown
                 result["content_length"] = content_len
                 result["error"] = None
+                if include_raw_html:
+                    result["raw_html"] = html
 
                 scrape_duration.labels(fetch_method="httpx").observe(elapsed)
                 scrape_total.labels(fetch_method="httpx", status="success").inc()
@@ -327,6 +345,8 @@ async def fetch_and_extract(
             result["markdown_content"] = markdown
             result["content_length"] = len(markdown)
             result["error"] = None
+            if include_raw_html:
+                result["raw_html"] = html
 
             scrape_duration.labels(fetch_method="playwright").observe(elapsed)
             scrape_total.labels(fetch_method="playwright", status="success").inc()

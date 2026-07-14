@@ -216,4 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Internal planning & audit docs (secret)
 IMPROVEMENT.md
+PLAN.md
+PLAN_FC-1.md
+PLAN_FC-2.md
+PLAN_FC-3.md
+VULNERABILITY.md

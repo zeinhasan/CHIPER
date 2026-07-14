@@ -27,6 +27,7 @@ from app.utils.links import (
     extract_internal_links,
     normalize_url,
 )
+from app.utils.domain_filter import is_domain_allowed
 from app.utils.security import is_safe_url
 from app.utils.sitemap import find_sitemap_url, parse_sitemap
 
@@ -261,6 +262,11 @@ async def discover_crawl(
                 if child_norm in visited:
                     continue
                 if r["depth"] + 1 > max_depth:
+                    continue
+                # Global domain block guard (admin-level blocklist).
+                if settings.domain_blocklist and not is_domain_allowed(
+                    child_norm, set(), settings.domain_blocklist
+                ):
                     continue
                 if len(results) + len(queue) >= max_urls:
                     break

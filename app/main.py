@@ -21,6 +21,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.api.routes import limiter, router
 from app.config import settings
+from app.services import history
 from app.middleware.auth import ApiKeyMiddleware
 from app.middleware.tracing import TracingMiddleware
 from app.utils.circuit_breaker import CircuitBreaker
@@ -41,7 +42,7 @@ async def lifespan(app: FastAPI):
 
     # --- Startup ---
     setup_logging()
-    logger.info("CHIPER v1.4.2 starting up...")
+    logger.info("CHIPER v1.5.0 starting up...")
 
     # Shared httpx client (connection pool reuse)
     app.state.http_client = httpx.AsyncClient(
@@ -89,6 +90,9 @@ async def lifespan(app: FastAPI):
     app.state.playwright_browsers = browsers
     logger.info("Browser pool ready: %d instances.", len(browsers))
 
+    # Persistent history (SQLite/PostgreSQL)
+    await history.init_db()
+
     yield  # Application runs here
 
     # --- Shutdown ---
@@ -101,7 +105,11 @@ async def lifespan(app: FastAPI):
 
     logger.info("Closing shared httpx client...")
     await app.state.http_client.aclose()
-    logger.info("httpx client closed. Goodbye!")
+    logger.info("httpx client closed.")
+
+    logger.info("Closing history DB...")
+    await history.close()
+    logger.info("History DB closed. Goodbye!")
 
 
 app = FastAPI(
@@ -111,7 +119,7 @@ app = FastAPI(
         "Middleware API that bridges AI agents with SearXNG for web research "
         "and content extraction, with optional AI summarization via DeepSeek."
     ),
-    version="1.4.2",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -154,7 +162,7 @@ app.include_router(router)
 @app.get("/health", tags=["system"])
 async def health_check() -> dict:
     """Simple health-check endpoint."""
-    return {"status": "ok", "version": "1.4.2"}
+    return {"status": "ok", "version": "1.5.0"}
 
 
 # --- Direct run (development) ---

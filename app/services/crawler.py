@@ -29,6 +29,7 @@ from playwright.async_api import Browser
 from app.config import settings
 from app.services.scraper import fetch_and_extract
 from app.utils.helpers import get_logger
+from app.utils.domain_filter import is_domain_allowed
 from app.utils.links import extract_internal_links, normalize_url
 from app.utils.security import is_safe_url
 
@@ -44,6 +45,9 @@ async def crawl(
     force_js_render: bool,
     http_client: httpx.AsyncClient,
     browsers: list[Browser],
+    *,
+    allow_domains: set[str] | None = None,
+    block_domains: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     BFS crawl starting from *seed_url*.
@@ -189,6 +193,11 @@ async def crawl(
                         "Skipped internal/blocked child URL (SSRF)",
                         extra={"url": child_norm},
                     )
+                    continue
+                # Domain allow/block guard.
+                if (allow_domains or block_domains) and not is_domain_allowed(
+                    child_norm, allow_domains or set(), block_domains or set()
+                ):
                     continue
 
                 visited.add(child_norm)

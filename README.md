@@ -119,23 +119,28 @@ CHIPER/
 │   │   └── routes.py            # POST /research + /crawl + /map + /extract endpoints
 │   ├── services/
 │   │   ├── searxng.py           # SearXNG JSON API integration
-│   │   ├── scraper.py           # Two-Tier scraping + JS garbage detection + browser pool
+│   │   ├── scraper.py           # Two-Tier scraping + JS garbage detection + PDF + browser pool
 │   │   ├── crawler.py           # BFS recursive crawl engine
 │   │   ├── discovery.py         # Site map discovery engine (sitemap + lightweight crawl)
 │   │   ├── extractor.py         # Structured data extraction engine (AI + JSON Schema)
-│   │   └── summarizer.py        # AI summarization (OpenAI-compatible LLM)
+│   │   ├── summarizer.py        # AI summarization (OpenAI-compatible LLM)
+│   │   └── history.py           # Persistent request history (SQLite/PostgreSQL)
 │   └── utils/
 │       ├── helpers.py           # Re-export logging utilities
 │       ├── logging.py           # Structured JSON logging + trace context
 │       ├── metrics.py           # Prometheus metrics definitions
 │       ├── circuit_breaker.py   # 3-state circuit breaker
 │       ├── links.py             # URL normalization + internal link extraction
+│       ├── domain_filter.py     # Domain allowlist/blocklist filtering
+│       ├── security.py          # SSRF URL validation
 │       ├── sitemap.py           # Sitemap XML parser (urlset + sitemap index + robots.txt)
 │       └── task_store.py        # In-memory background task store
 ├── searxng/
 │   └── settings.yml             # SearXNG configuration
 ├── Dockerfile                   # CHIPER image build
 ├── docker-compose.yml           # All-in-one: DoH proxy + SearXNG + CHIPER
+├── tests/
+│   └── test_domain_filter.py    # Assert-based self-check for domain filtering
 ├── requirements.txt             # Python dependencies
 ├── IMPROVEMENT.md               # Improvement roadmap
 ├── .env.example                 # Environment variables template
@@ -188,6 +193,9 @@ Executes the research pipeline. Supports two modes:
 | `force_js_render` | bool | `false` | Skip Tier-1 for all URLs |
 | `generate_summary` | bool | `false` | Generate AI summary. Runs synchronously when `run_async: false` (summary returned directly). |
 | `run_async` | bool | `false` | Run entire pipeline as background task. Returns `task_id` immediately. Poll `GET /research/{task_id}` for full result. |
+| `summary_prompt` | string | `null` | Optional custom system prompt for summarization (overrides default). |
+| `allow_domains` | string[] | `[]` | Per-request domain allowlist (empty = allow all). |
+| `block_domains` | string[] | `[]` | Per-request domain blocklist (block wins over allow). |
 
 #### Response — With Summary (Sync Mode)
 
@@ -263,6 +271,9 @@ Supports two modes:
 | `force_js_render` | bool | `false` | Use Playwright for all pages (skip Tier-1) |
 | `generate_summary` | bool | `false` | Generate AI summary of all crawled content |
 | `run_async` | bool | `false` | Run crawl as background task |
+| `summary_prompt` | string | `null` | Optional custom system prompt for summarization (overrides default). |
+| `allow_domains` | string[] | `[]` | Per-request domain allowlist (empty = allow all). |
+| `block_domains` | string[] | `[]` | Per-request domain blocklist (block wins over allow). |
 
 #### Response (Sync Mode)
 
@@ -347,6 +358,8 @@ Supports **synchronous** (`run_async: false`, default) and **async** (`run_async
 | `include_subdomains` | bool | `false` | Treat subdomains as internal (e.g. `blog.example.com`) |
 | `ignore_query_params` | bool | `false` | Strip `?query=...` before dedup |
 | `run_async` | bool | `false` | Run as background task |
+| `allow_domains` | string[] | `[]` | Per-request domain allowlist (empty = allow all). |
+| `block_domains` | string[] | `[]` | Per-request domain blocklist (block wins over allow). |
 
 #### Response (Sync Mode)
 
@@ -453,12 +466,14 @@ Supports **synchronous** (`run_async: false`, default) and **async** (`run_async
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `urls` | list\[string\] | — | URLs to extract data from *(required, 1–20)* |
+| `urls` | list\[string \| object\] | — | URLs to extract from *(required, 1–20)*. Each item may be a string or `{ "url": ..., "force_js_render": true }` for per-URL config. |
 | `prompt` | string | — | Natural-language description of data to extract *(required, 10–2000 chars)* |
 | `json_schema` | object\|null | `null` | JSON Schema to validate the extracted data |
 | `extract_mode` | string | `"combined"` | `"combined"` or `"per_page"` |
-| `force_js_render` | bool | `false` | Use Playwright for all pages (skip Tier-1) |
+| `force_js_render` | bool | `false` | Use Playwright for all pages (skip Tier-1). Overridden per-URL when a `urls` object sets its own value. |
 | `run_async` | bool | `false` | Run extraction as background task |
+| `allow_domains` | string[] | `[]` | Per-request domain allowlist (empty = allow all). |
+| `block_domains` | string[] | `[]` | Per-request domain blocklist (block wins over allow). |
 
 #### Response (Sync Mode)
 
@@ -559,6 +574,42 @@ Exposes Prometheus metrics (OpenMetrics format).
 | `EXTRACT_MAX_CONTENT_CHARS` | `8000` | Max content chars per URL sent to LLM |
 | `EXTRACT_TEMPERATURE` | `0.1` | LLM temperature (lower = more deterministic) |
 | `EXTRACT_RETRIES` | `1` | Retries if LLM returns invalid JSON (schema mode) |
+| `DOMAIN_ALLOWLIST` | *(empty)* | Global allowlist (comma-separated hostnames; empty = allow all) |
+| `DOMAIN_BLOCKLIST` | *(empty)* | Global blocklist (comma-separated hostnames; block wins over allow) |
+| `PDF_ENABLED` | `true` | Detect & extract text from PDF URLs (PyMuPDF) |
+| `PDF_MAX_PAGES` | `50` | Max PDF pages to extract per document |
+| `HISTORY_ENABLED` | `true` | Persist request history to a database |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./chiper_history.db` | History DB URL (SQLite default; `postgresql+asyncpg://...` for Postgres) |
+| `HISTORY_RETENTION_DAYS` | `30` | Auto-purge history older than N days (0 = keep forever) |
+| `HISTORY_STORE_FULL_CONTENT` | `false` | Store full result content vs. compact summary only |
+
+---
+
+## 🔒 Domain Filtering
+
+Control which domains may be scraped, globally (env) or per-request.
+
+- **Global**: `DOMAIN_ALLOWLIST` / `DOMAIN_BLOCKLIST` (comma-separated hostnames).
+- **Per-request**: `allow_domains` / `block_domains` arrays on `/research`, `/crawl`, `/map`, `/extract`.
+- **Matching** is suffix-based: `example.com` also covers `www.example.com` and `blog.example.com`.
+- **Precedence**: block wins over allow. An empty allowlist means "allow all" (subject to the blocklist).
+- Blocked seed URLs return HTTP 400; blocked crawl/discovery child URLs are silently skipped.
+
+## 📄 PDF Scraping
+
+URLs pointing to PDFs are auto-detected (Content-Type, `.pdf` extension, or `%PDF-` magic
+bytes) and their text is extracted via PyMuPDF, returned with `fetch_method: "pdf"`.
+Encrypted or scanned (image-only) PDFs return a clear error. No OCR. Toggle via `PDF_ENABLED`.
+
+## 🗂️ Persistent History
+
+Every completed request is recorded to a database (SQLite by default, PostgreSQL via
+`DATABASE_URL`). Writes are best-effort and never break a request.
+
+- `GET /api/v1/history?kind=&limit=&offset=` — list entries (newest first).
+- `GET /api/v1/history/{id}` — fetch a single entry.
+
+`kind` is one of `research` | `crawl` | `map` | `extract`.
 
 ---
 

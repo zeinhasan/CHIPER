@@ -27,7 +27,7 @@ from openai import AsyncOpenAI
 from playwright.async_api import Browser
 
 from app.config import settings
-from app.models.schemas import ExtractData
+from app.models.schemas import ExtractData, UrlSpec
 from app.services.scraper import fetch_and_extract
 from app.utils.helpers import get_logger
 from app.utils.metrics import extract_duration, extract_total
@@ -317,7 +317,7 @@ async def _extract_from_content(
 
 
 async def run_extraction(
-    urls: list[str],
+    urls: list[UrlSpec],
     prompt: str,
     schema: dict | None,
     extract_mode: str,
@@ -344,19 +344,26 @@ async def run_extraction(
     total_urls = len(urls)
     results: list[ExtractData] = []
 
-    # ── Step 1: Scrape all URLs concurrently ────────────────────
+    # Flatten to plain URL strings for indexing/reporting.
+    url_strs = [u.url for u in urls]
+
+    # ── Step 1: Scrape all URLs concurrently (per-URL force_js_render) ─
     semaphore = asyncio.Semaphore(3)  # Limit concurrent Playwright contexts
     pool = itertools.cycle(browsers)
 
     scrape_tasks = [
         fetch_and_extract(
-            url,
+            spec.url,
             next(pool),
             http_client,
-            force_js_render=force_js_render,
+            force_js_render=(
+                spec.force_js_render
+                if spec.force_js_render is not None
+                else force_js_render
+            ),
             semaphore=semaphore,
         )
-        for url in urls
+        for spec in urls
     ]
     scrape_results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
 
@@ -371,15 +378,15 @@ async def run_extraction(
         for i, r in enumerate(scrape_results):
             if isinstance(r, BaseException):
                 logger.warning(
-                    "Scrape failed for URL", extra={"url": urls[i], "error": str(r)}
+                    "Scrape failed for URL", extra={"url": url_strs[i], "error": str(r)}
                 )
-                results.append(ExtractData(url=urls[i], extraction=None, error=str(r)))
+                results.append(ExtractData(url=url_strs[i], extraction=None, error=str(r)))
                 failed += 1
                 continue
 
             if r.get("error"):
                 results.append(
-                    ExtractData(url=urls[i], extraction=None, error=r["error"])
+                    ExtractData(url=url_strs[i], extraction=None, error=r["error"])
                 )
                 failed += 1
                 continue
@@ -390,13 +397,13 @@ async def run_extraction(
                     "\n\n[... content truncated ...]"
                 )
 
-            combined_parts.append(f"--- Page {i + 1}: {urls[i]} ---\n{content}")
-            successful_urls.append(urls[i])
+            combined_parts.append(f"--- Page {i + 1}: {url_strs[i]} ---\n{content}")
+            successful_urls.append(url_strs[i])
 
         if not combined_parts:
             logger.warning("All URLs failed to scrape — no content to extract")
             # Ensure all URLs have a result entry
-            for url in urls:
+            for url in url_strs:
                 if not any(d.url == url for d in results):
                     results.append(
                         ExtractData(
@@ -433,13 +440,13 @@ async def run_extraction(
 
         for i, r in enumerate(scrape_results):
             if isinstance(r, BaseException):
-                results.append(ExtractData(url=urls[i], extraction=None, error=str(r)))
+                results.append(ExtractData(url=url_strs[i], extraction=None, error=str(r)))
                 failed += 1
                 continue
 
             if r.get("error"):
                 results.append(
-                    ExtractData(url=urls[i], extraction=None, error=r["error"])
+                    ExtractData(url=url_strs[i], extraction=None, error=r["error"])
                 )
                 failed += 1
                 continue
@@ -452,13 +459,13 @@ async def run_extraction(
 
             if not content.strip():
                 results.append(
-                    ExtractData(url=urls[i], extraction=None, error="Empty content")
+                    ExtractData(url=url_strs[i], extraction=None, error="Empty content")
                 )
                 failed += 1
                 continue
 
-            task_indices.append((i, urls[i]))
-            extract_tasks.append((urls[i], content, schema, prompt))
+            task_indices.append((i, url_strs[i]))
+            extract_tasks.append((url_strs[i], content, schema, prompt))
 
         # Run all LLM extractions concurrently
         if extract_tasks:
@@ -494,7 +501,7 @@ async def run_extraction(
                     )
         else:
             # All URLs failed during scrape
-            for url in urls:
+            for url in url_strs:
                 if not any(d.url == url for d in results):
                     results.append(
                         ExtractData(

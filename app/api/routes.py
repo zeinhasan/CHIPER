@@ -28,6 +28,8 @@ from app.models.schemas import (
     ExtractRequest,
     ExtractResponse,
     ExtractTaskStatusResponse,
+    HistoryEntry,
+    HistoryListResponse,
     MapRequest,
     MapResponse,
     MapTaskStatusResponse,
@@ -37,8 +39,17 @@ from app.models.schemas import (
     ScrapeResult,
     TaskStatusResponse,
 )
-from app.services import crawler, discovery, extractor, scraper, searxng, summarizer
+from app.services import (
+    crawler,
+    discovery,
+    extractor,
+    history,
+    scraper,
+    searxng,
+    summarizer,
+)
 from app.utils.circuit_breaker import CircuitBreakerOpenError
+from app.utils.domain_filter import is_domain_allowed, merge_domain_rules
 from app.utils.helpers import get_logger
 from app.utils.security import validate_url_safe
 from app.utils.task_store import task_store
@@ -49,6 +60,9 @@ logger = get_logger(__name__)
 _ERR_INTERNAL = "An internal error occurred. Check server logs for details."
 _ERR_SSRF = "URL points to an internal/private address and was blocked."
 _ERR_TASK_LIMIT = "Too many concurrent tasks. Please try again later."
+_ERR_DOMAIN_BLOCKED = (
+    "URL domain is not allowed by the configured allow/block list."
+)
 
 
 def _create_task_safe(query: str | None = None) -> str:
@@ -98,15 +112,18 @@ BLOCKED_DOMAINS: set[str] = {
 }
 
 
-def _is_blocked_domain(url: str) -> bool:
-    """Check if a URL is from a blocked video/media domain."""
-    from urllib.parse import urlparse
+def _resolve_domain_rules(
+    allow_domains: list[str], block_domains: list[str]
+) -> tuple[set[str], set[str]]:
+    """Merge global (env) and per-request allow/block rules.
 
-    try:
-        hostname = urlparse(url).hostname or ""
-        return hostname.lower() in BLOCKED_DOMAINS
-    except Exception:
-        return False
+    The media BLOCKED_DOMAINS are always seeded into the blocklist.
+    """
+    allow = merge_domain_rules(settings.domain_allowlist, allow_domains)
+    block = merge_domain_rules(
+        settings.domain_blocklist | BLOCKED_DOMAINS, block_domains
+    )
+    return allow, block
 
 
 router = APIRouter(prefix="/api/v1", tags=["research"])
@@ -201,10 +218,10 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
 
     urls = [r["url"] for r in search_results if r.get("url")]
 
-    # Filter out video/media domains that can't be scraped for text,
-    # and drop URLs that resolve to internal/private addresses (SSRF).
+    # Filter: SSRF-safe + allow/block domain rules.
+    allow, block = _resolve_domain_rules(payload.allow_domains, payload.block_domains)
     filtered_urls = [
-        u for u in urls if not _is_blocked_domain(u) and validate_url_safe(u)
+        u for u in urls if validate_url_safe(u) and is_domain_allowed(u, allow, block)
     ]
     if len(filtered_urls) < len(urls):
         logger.info(
@@ -252,7 +269,9 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
                 extra={"document_count": len(documents)},
             )
             try:
-                ai_summary = await summarizer.summarize(documents, payload.query)
+                ai_summary = await summarizer.summarize(
+                    documents, payload.query, system_prompt=payload.summary_prompt
+                )
             except Exception as exc:
                 logger.error("Summarization failed", extra={"error": str(exc)})
                 ai_summary = _ERR_INTERNAL
@@ -266,6 +285,15 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
                 },
             )
 
+            await history.save(
+                id=None,
+                kind="research",
+                query_or_url=payload.query,
+                params={"max_results": payload.max_results},
+                status="done",
+                result={"ai_summary": ai_summary, "total_results": len(results)},
+                result_size=len(results),
+            )
             return ResearchResponse(
                 query=payload.query,
                 ai_summary=ai_summary,
@@ -282,6 +310,15 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
         },
     )
 
+    await history.save(
+        id=None,
+        kind="research",
+        query_or_url=payload.query,
+        params={"max_results": payload.max_results},
+        status="done",
+        result={"total_results": len(results)},
+        result_size=len(results),
+    )
     return ResearchResponse(
         query=payload.query,
         results=results,
@@ -331,9 +368,14 @@ async def _run_full_research(
 
         urls = [r["url"] for r in search_results if r.get("url")]
 
-        # Filter out video/media domains + SSRF-unsafe URLs
+        # Filter: SSRF-safe + allow/block domain rules.
+        allow, block = _resolve_domain_rules(
+            payload.allow_domains, payload.block_domains
+        )
         filtered_urls = [
-            u for u in urls if not _is_blocked_domain(u) and validate_url_safe(u)
+            u
+            for u in urls
+            if validate_url_safe(u) and is_domain_allowed(u, allow, block)
         ]
         if len(filtered_urls) < len(urls):
             logger.info(
@@ -377,7 +419,9 @@ async def _run_full_research(
         documents = [r["markdown_content"] for r in results if r["markdown_content"]]
         if documents:
             try:
-                ai_summary = await summarizer.summarize(documents, payload.query)
+                ai_summary = await summarizer.summarize(
+                    documents, payload.query, system_prompt=payload.summary_prompt
+                )
             except Exception as exc:
                 logger.error(
                     "Summarization failed in background",
@@ -404,6 +448,15 @@ async def _run_full_research(
                 "results": results,
                 "total_results": len(results),
             },
+        )
+        await history.save(
+            id=task_id,
+            kind="research",
+            query_or_url=payload.query,
+            params={"max_results": payload.max_results, "async": True},
+            status="done",
+            result={"ai_summary": ai_summary, "total_results": len(results)},
+            result_size=len(results),
         )
 
     except asyncio.TimeoutError:
@@ -506,6 +559,13 @@ async def crawl_endpoint(request: Request, payload: CrawlRequest) -> CrawlRespon
     if validate_url_safe(payload.url) is None:
         raise HTTPException(status_code=400, detail=_ERR_SSRF)
 
+    # ── Domain allow/block check ─────────────────────────────────
+    _allow, _block = _resolve_domain_rules(
+        payload.allow_domains, payload.block_domains
+    )
+    if not is_domain_allowed(payload.url, _allow, _block):
+        raise HTTPException(status_code=400, detail=_ERR_DOMAIN_BLOCKED)
+
     # ── Async Mode ────────────────────────────────────────────────
     if payload.run_async:
         task_id = _create_task_safe(payload.url)
@@ -539,6 +599,8 @@ async def crawl_endpoint(request: Request, payload: CrawlRequest) -> CrawlRespon
                 force_js_render=payload.force_js_render,
                 http_client=http_client,
                 browsers=browsers,
+                allow_domains=merge_domain_rules(settings.domain_allowlist, payload.allow_domains),
+                block_domains=merge_domain_rules(settings.domain_blocklist, payload.block_domains),
             ),
             timeout=settings.crawl_total_timeout,
         )
@@ -564,7 +626,9 @@ async def crawl_endpoint(request: Request, payload: CrawlRequest) -> CrawlRespon
                 extra={"document_count": len(documents)},
             )
             try:
-                ai_summary = await summarizer.summarize(documents, payload.url)
+                ai_summary = await summarizer.summarize(
+                    documents, payload.url, system_prompt=payload.summary_prompt
+                )
             except Exception as exc:
                 logger.error("Crawl summarization failed", extra={"error": str(exc)})
                 ai_summary = _ERR_INTERNAL
@@ -590,6 +654,15 @@ async def crawl_endpoint(request: Request, payload: CrawlRequest) -> CrawlRespon
         },
     )
 
+    await history.save(
+        id=None,
+        kind="crawl",
+        query_or_url=payload.url,
+        params={"max_depth": payload.max_depth, "max_pages": payload.max_pages},
+        status="done",
+        result={"ai_summary": ai_summary, "total_pages": len(pages)},
+        result_size=len(pages),
+    )
     return CrawlResponse(
         base_url=payload.url,
         total_pages=len(pages),
@@ -616,6 +689,8 @@ async def _run_crawl_background(
                 force_js_render=payload.force_js_render,
                 http_client=http_client,
                 browsers=browsers,
+                allow_domains=merge_domain_rules(settings.domain_allowlist, payload.allow_domains),
+                block_domains=merge_domain_rules(settings.domain_blocklist, payload.block_domains),
             ),
             timeout=settings.crawl_total_timeout,
         )
@@ -629,7 +704,11 @@ async def _run_crawl_background(
             ]
             if documents:
                 try:
-                    ai_summary = await summarizer.summarize(documents, payload.url)
+                    ai_summary = await summarizer.summarize(
+                        documents,
+                        payload.url,
+                        system_prompt=payload.summary_prompt,
+                    )
                 except Exception:
                     ai_summary = _ERR_INTERNAL
 
@@ -654,6 +733,15 @@ async def _run_crawl_background(
                 "ai_summary": ai_summary,
                 "results": pages,
             },
+        )
+        await history.save(
+            id=task_id,
+            kind="crawl",
+            query_or_url=payload.url,
+            params={"max_depth": payload.max_depth, "max_pages": payload.max_pages},
+            status="done",
+            result={"ai_summary": ai_summary, "total_pages": len(pages)},
+            result_size=len(pages),
         )
 
         logger.info(
@@ -746,6 +834,13 @@ async def map_endpoint(request: Request, payload: MapRequest) -> MapResponse:
     if validate_url_safe(payload.url) is None:
         raise HTTPException(status_code=400, detail=_ERR_SSRF)
 
+    # ── Domain allow/block check ─────────────────────────────────
+    _allow, _block = _resolve_domain_rules(
+        payload.allow_domains, payload.block_domains
+    )
+    if not is_domain_allowed(payload.url, _allow, _block):
+        raise HTTPException(status_code=400, detail=_ERR_DOMAIN_BLOCKED)
+
     # ── Async Mode ────────────────────────────────────────────────
     if payload.run_async:
         task_id = _create_task_safe(payload.url)
@@ -805,6 +900,18 @@ async def map_endpoint(request: Request, payload: MapRequest) -> MapResponse:
         },
     )
 
+    await history.save(
+        id=None,
+        kind="map",
+        query_or_url=payload.url,
+        params={"discovery_method": payload.discovery_method},
+        status="done",
+        result={
+            "total_urls": len(urls),
+            "discovery_method": result["discovery_method"],
+        },
+        result_size=len(urls),
+    )
     return MapResponse(
         base_url=payload.url,
         total_urls=len(urls),
@@ -849,6 +956,18 @@ async def _run_map_background(
                 "sitemap_count": result.get("sitemap_count", 0),
                 "crawl_count": result.get("crawl_count", 0),
             },
+        )
+        await history.save(
+            id=task_id,
+            kind="map",
+            query_or_url=payload.url,
+            params={"discovery_method": payload.discovery_method},
+            status="done",
+            result={
+                "total_urls": len(result["urls"]),
+                "discovery_method": result["discovery_method"],
+            },
+            result_size=len(result["urls"]),
         )
 
         logger.info(
@@ -934,19 +1053,34 @@ async def extract_endpoint(
 
     Supports async mode via run_async=True — poll with GET /api/v1/extract/{task_id}.
     """
+    url_strs = [spec.url for spec in payload.urls]
+
     logger.info(
         "Extract request received",
         extra={
-            "url_count": len(payload.urls),
-            "urls": payload.urls[:5],
+            "url_count": len(url_strs),
+            "urls": url_strs[:5],
             "mode": payload.extract_mode,
             "has_schema": payload.json_schema is not None,
             "run_async": payload.run_async,
         },
     )
 
+    # ── Domain allow/block check ─────────────────────────────────
+    allow, block = _resolve_domain_rules(payload.allow_domains, payload.block_domains)
+    blocked_domains = [u for u in url_strs if not is_domain_allowed(u, allow, block)]
+    if blocked_domains:
+        logger.warning(
+            "Domain-blocked URLs in extract request",
+            extra={"count": len(blocked_domains), "urls": blocked_domains[:3]},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"{_ERR_DOMAIN_BLOCKED} ({len(blocked_domains)} URL(s) blocked)",
+        )
+
     # ── SSRF check (validate all URLs) ───────────────────────────
-    unsafe_urls = [u for u in payload.urls if validate_url_safe(u) is None]
+    unsafe_urls = [u for u in url_strs if validate_url_safe(u) is None]
     if unsafe_urls:
         logger.warning(
             "SSRF blocked URLs",
@@ -964,7 +1098,7 @@ async def extract_endpoint(
         except jsonschema.SchemaError as exc:
             logger.warning(
                 "Invalid JSON Schema received",
-                extra={"error": str(exc), "urls": payload.urls[:3]},
+                extra={"error": str(exc), "urls": url_strs[:3]},
             )
             raise HTTPException(
                 status_code=422,
@@ -973,10 +1107,10 @@ async def extract_endpoint(
 
     # ── Async Mode ──────────────────────────────────
     if payload.run_async:
-        task_id = _create_task_safe(str(payload.urls))
+        task_id = _create_task_safe(", ".join(url_strs))
         logger.info(
             "Starting background extraction",
-            extra={"task_id": task_id, "url_count": len(payload.urls)},
+            extra={"task_id": task_id, "url_count": len(url_strs)},
         )
         _spawn_background(
             _run_extract_background(
@@ -1024,6 +1158,15 @@ async def extract_endpoint(
         logger.error("Extraction failed", extra={"error": str(exc)})
         raise HTTPException(status_code=500, detail=_ERR_INTERNAL)
 
+    await history.save(
+        id=None,
+        kind="extract",
+        query_or_url=", ".join(url_strs),
+        params={"extract_mode": payload.extract_mode},
+        status="done" if failed == 0 else "error",
+        result={"success": failed == 0, "failed_urls": failed},
+        result_size=len(payload.urls),
+    )
     return ExtractResponse(
         success=failed == 0,
         data=data_list,
@@ -1031,7 +1174,6 @@ async def extract_endpoint(
         failed_urls=failed,
         extract_mode=payload.extract_mode,
     )
-
 
 async def _run_extract_background(
     task_id: str,
@@ -1068,6 +1210,15 @@ async def _run_extract_background(
                 "failed_urls": failed,
                 "extract_mode": payload.extract_mode,
             },
+        )
+        await history.save(
+            id=task_id,
+            kind="extract",
+            query_or_url=", ".join(spec.url for spec in payload.urls),
+            params={"extract_mode": payload.extract_mode},
+            status="done" if failed == 0 else "error",
+            result={"success": failed == 0, "failed_urls": failed},
+            result_size=len(payload.urls),
         )
 
         logger.info(
@@ -1132,3 +1283,31 @@ async def get_extract_task_status(task_id: str) -> ExtractTaskStatusResponse:
         )
 
     return ExtractTaskStatusResponse(task_id=task_id, status=task["status"])
+
+
+# ── Persistent History ────────────────────────────────────────
+
+
+@router.get("/history", response_model=HistoryListResponse)
+async def list_history_endpoint(
+    kind: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> HistoryListResponse:
+    """List persisted request history (newest first). Filter by ``kind``."""
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    entries = await history.list_history(kind=kind, limit=limit, offset=offset)
+    return HistoryListResponse(
+        total=len(entries),
+        entries=[HistoryEntry(**e) for e in entries],
+    )
+
+
+@router.get("/history/{entry_id}", response_model=HistoryEntry)
+async def get_history_endpoint(entry_id: str) -> HistoryEntry:
+    """Fetch a single history entry by id."""
+    entry = await history.get(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="History entry not found.")
+    return HistoryEntry(**entry)

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.5.0] — 2026-07-14
+
+### Added
+- **Domain Allowlist / Blocklist** — Filter which domains may be scraped, at two levels: global via `DOMAIN_ALLOWLIST` / `DOMAIN_BLOCKLIST` env vars (comma-separated) and per-request via `allow_domains` / `block_domains` fields on all four endpoints. Suffix matching (`example.com` covers `www.`/`blog.`); block always wins over allow; empty allowlist = allow all. The existing media blocklist (YouTube, etc.) is folded into the blocklist. Enforced on seed URLs (400 if blocked) and on crawl/discovery child URLs. (`domain_filter.py`, `routes.py`, `crawler.py`, `discovery.py`, `schemas.py`, `config.py`)
+- **Persistent History** — Every completed request (research/crawl/map/extract) is recorded to a database. Defaults to SQLite (`DATABASE_URL=sqlite+aiosqlite:///./chiper_history.db`, zero-config); set a `postgresql+asyncpg://` URL for PostgreSQL. New endpoints `GET /api/v1/history` (list, filter by `kind`, paginated) and `GET /api/v1/history/{id}` (detail). Writes are best-effort — a DB failure never breaks a request. Configurable via `HISTORY_ENABLED`, `HISTORY_RETENTION_DAYS` (auto-purge), `HISTORY_STORE_FULL_CONTENT`. (`history.py`, `main.py`, `routes.py`, `schemas.py`, `config.py`)
+- **Custom Summarization Prompt** — Optional `summary_prompt` field on `/research` and `/crawl` overrides the default summarization system prompt. Sanitized (XML-tag stripping) and wrapped with an injection-boundary instruction; source documents are enclosed in `<user_input>` delimiters. (`summarizer.py`, `routes.py`, `schemas.py`)
+- **Scraping Per-Page Config** — `/extract` `urls` now accepts either plain strings (unchanged) or `{ "url": ..., "force_js_render": true }` objects, allowing `force_js_render` to be set per-URL. A per-URL value falls back to the request-level `force_js_render` when omitted. (`schemas.py`, `extractor.py`, `routes.py`)
+- **PDF Scraping** — URLs pointing to PDFs are detected (Content-Type, `.pdf` extension, or `%PDF-` magic bytes) and their text extracted via PyMuPDF, entering the normal pipeline with `fetch_method="pdf"`. Tier-2 (Playwright) is skipped for PDFs. Encrypted or scanned (no text layer) PDFs return a clear error; no OCR. Configurable via `PDF_ENABLED` and `PDF_MAX_PAGES`. (`scraper.py`, `config.py`, `requirements.txt`)
+
+### Dependencies
+- Added `pymupdf` (PDF parsing), `sqlalchemy[asyncio]` + `aiosqlite` (history). `asyncpg` optional (commented) for PostgreSQL. (`requirements.txt`)
+
+### Added (env vars)
+- `DOMAIN_ALLOWLIST`, `DOMAIN_BLOCKLIST`, `PDF_ENABLED`, `PDF_MAX_PAGES`, `HISTORY_ENABLED`, `DATABASE_URL`, `HISTORY_RETENTION_DAYS`, `HISTORY_STORE_FULL_CONTENT`. (`config.py`, `.env`, `.env.example`)
+
+---
+
 ## [1.4.2] — 2026-07-14
 
 ### Security

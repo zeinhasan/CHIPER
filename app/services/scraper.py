@@ -129,11 +129,52 @@ def _extract_markdown(html: str) -> str:
         return (extracted or "").strip()
 
 
+def _looks_like_pdf(url: str, content_type: str, head: bytes) -> bool:
+    """Detect PDF via Content-Type, .pdf extension, or %PDF- magic bytes."""
+    if "application/pdf" in content_type.lower():
+        return True
+    if url.split("?", 1)[0].lower().endswith(".pdf"):
+        return True
+    return head[:5] == b"%PDF-"
+
+
+def _extract_pdf(data: bytes) -> tuple[str | None, str | None]:
+    """Extract text from PDF bytes via PyMuPDF. Returns (text, error)."""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return None, "PDF support not installed (pymupdf missing)"
+
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception as exc:
+        return None, f"Failed to open PDF: {exc}"
+
+    try:
+        if doc.needs_pass:
+            return None, "Encrypted PDF (password required)"
+        parts: list[str] = []
+        for i, page in enumerate(doc):
+            if i >= settings.pdf_max_pages:
+                break
+            parts.append(page.get_text("text"))
+        text = "\n\n".join(parts).strip()
+        if not text:
+            return None, "PDF has no extractable text (likely scanned image)"
+        return text, None
+    finally:
+        doc.close()
+
+
 async def _fetch_static(
     url: str,
     client: httpx.AsyncClient,
-) -> tuple[str | None, str | None]:
-    """Tier 1: static fetch with retry + backoff."""
+) -> tuple[str | None, str | None, bool]:
+    """Tier 1: static fetch with retry + backoff.
+
+    Returns (content, error, is_pdf). When *is_pdf* is True, *content* is
+    already-extracted PDF text (not HTML) and Tier-2 should be skipped.
+    """
     max_body = settings.scrape_max_body_mb * 1024 * 1024
     headers = {
         "User-Agent": (
@@ -173,14 +214,28 @@ async def _fetch_static(
                         return (
                             None,
                             f"Response too large (>{max_body} bytes)",
+                            False,
                         )
                     chunks.append(chunk)
 
                 body = b"".join(chunks)
-                return body.decode(resp.encoding or "utf-8", errors="replace"), None
+
+                # ── PDF detection & extraction ────────────────────
+                content_type = resp.headers.get("content-type", "")
+                if settings.pdf_enabled and _looks_like_pdf(
+                    url, content_type, body[:5]
+                ):
+                    text, pdf_err = _extract_pdf(body)
+                    return text, pdf_err, True
+
+                return (
+                    body.decode(resp.encoding or "utf-8", errors="replace"),
+                    None,
+                    False,
+                )
         except httpx.HTTPStatusError as exc:
             if 400 <= exc.response.status_code < 500:
-                return None, f"HTTP {exc.response.status_code}"
+                return None, f"HTTP {exc.response.status_code}", False
             last_error = f"HTTP {exc.response.status_code}"
         except httpx.RequestError as exc:
             last_error = f"Request error: {exc}"
@@ -197,8 +252,7 @@ async def _fetch_static(
             )
             await asyncio.sleep(delay)
 
-    return None, last_error
-
+    return None, last_error, False
 
 async def _fetch_dynamic(
     url: str,
@@ -300,7 +354,30 @@ async def fetch_and_extract(
 
     # --- Tier 1: Static (httpx) ---
     if not force_js_render:
-        html, error = await _fetch_static(url, client)
+        html, error, is_pdf = await _fetch_static(url, client)
+
+        # PDF: content is already extracted text; skip Tier-2 entirely.
+        if is_pdf:
+            elapsed = time.monotonic() - start
+            if html:
+                result["fetch_method"] = "pdf"
+                result["markdown_content"] = html
+                result["content_length"] = len(html)
+                result["error"] = None
+                scrape_duration.labels(fetch_method="pdf").observe(elapsed)
+                scrape_total.labels(fetch_method="pdf", status="success").inc()
+                logger.info(
+                    "Tier-1 (pdf) SUCCESS",
+                    extra={"url": url, "content_length": len(html)},
+                )
+            else:
+                result["fetch_method"] = "pdf-failed"
+                result["error"] = error or "PDF extraction failed"
+                scrape_total.labels(fetch_method="pdf-failed", status="failure").inc()
+                logger.warning(
+                    "Tier-1 (pdf) FAILED", extra={"url": url, "error": result["error"]}
+                )
+            return result
 
         if html:
             markdown = _extract_markdown(html)

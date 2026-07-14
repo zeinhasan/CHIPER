@@ -7,6 +7,20 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 
+def _normalize_url_str(url: str) -> str:
+    """Trim, add https:// if missing, validate scheme + length."""
+    if not url or not url.strip():
+        raise ValueError("URL cannot be empty")
+    url = url.strip()
+    if "://" not in url:
+        url = "https://" + url
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("URL must start with http:// or https://")
+    if len(url) > 2048:
+        raise ValueError("URL too long (max 2048 characters)")
+    return url
+
+
 class ResearchRequest(BaseModel):
     """Incoming research query payload."""
 
@@ -34,6 +48,21 @@ class ResearchRequest(BaseModel):
     run_async: bool = Field(
         default=False,
         description="If True, run the entire research pipeline as a background task. Use GET /api/v1/research/{task_id} to poll for results. When enabled, summarization is always triggered regardless of generate_summary.",
+    )
+    summary_prompt: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="Optional custom system prompt for AI summarization (overrides the default).",
+    )
+    allow_domains: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Per-request domain allowlist (empty = allow all). Merged with global DOMAIN_ALLOWLIST.",
+    )
+    block_domains: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Per-request domain blocklist. Merged with global DOMAIN_BLOCKLIST. Block wins over allow.",
     )
 
 
@@ -85,16 +114,7 @@ class CrawlRequest(BaseModel):
     @field_validator("url")
     @classmethod
     def _validate_url(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("URL cannot be empty")
-        v = v.strip()
-        if "://" not in v:
-            v = "https://" + v
-        if not v.startswith(("http://", "https://")):
-            raise ValueError("URL must start with http:// or https://")
-        if len(v) > 2048:
-            raise ValueError("URL too long (max 2048 characters)")
-        return v
+        return _normalize_url_str(v)
 
     max_depth: int = Field(
         default=3,
@@ -127,6 +147,21 @@ class CrawlRequest(BaseModel):
     run_async: bool = Field(
         default=False,
         description="If True, run crawl as background task. Use GET /api/v1/crawl/{task_id} to poll.",
+    )
+    summary_prompt: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="Optional custom system prompt for AI summarization (overrides the default).",
+    )
+    allow_domains: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Per-request domain allowlist (empty = allow all). Merged with global DOMAIN_ALLOWLIST.",
+    )
+    block_domains: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Per-request domain blocklist. Merged with global DOMAIN_BLOCKLIST. Block wins over allow.",
     )
 
 
@@ -177,16 +212,7 @@ class MapRequest(BaseModel):
     @field_validator("url")
     @classmethod
     def _validate_url(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("URL cannot be empty")
-        v = v.strip()
-        if "://" not in v:
-            v = "https://" + v
-        if not v.startswith(("http://", "https://")):
-            raise ValueError("URL must start with http:// or https://")
-        if len(v) > 2048:
-            raise ValueError("URL too long (max 2048 characters)")
-        return v
+        return _normalize_url_str(v)
 
     discovery_method: Literal["sitemap", "crawl", "hybrid"] = Field(
         default="hybrid",
@@ -224,6 +250,16 @@ class MapRequest(BaseModel):
     run_async: bool = Field(
         default=False,
         description="If True, run as background task. Use GET /api/v1/map/{task_id} to poll.",
+    )
+    allow_domains: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Per-request domain allowlist (empty = allow all). Merged with global DOMAIN_ALLOWLIST.",
+    )
+    block_domains: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Per-request domain blocklist. Merged with global DOMAIN_BLOCKLIST. Block wins over allow.",
     )
 
 
@@ -268,33 +304,57 @@ class MapTaskStatusResponse(BaseModel):
 # ── Structured Data Extraction ─────────────────────────────────────
 
 
+class UrlSpec(BaseModel):
+    """A single URL with an optional per-URL scraping override."""
+
+    url: str
+    force_js_render: bool | None = Field(
+        default=None,
+        description="Per-URL override. If null, falls back to the request-level force_js_render.",
+    )
+
+
 class ExtractRequest(BaseModel):
     """Incoming structured data extraction payload."""
 
-    urls: list[str] = Field(
+    urls: list[UrlSpec] = Field(
         ...,
         min_length=1,
         max_length=20,
-        description="List of URLs to extract data from (1-20).",
+        description=(
+            "List of URLs to extract data from (1-20). Each entry may be a "
+            "plain string or an object {url, force_js_render} for per-URL config."
+        ),
     )
 
-    @field_validator("urls")
+    @field_validator("urls", mode="before")
     @classmethod
-    def _validate_urls(cls, v: list[str]) -> list[str]:
-        for i, url in enumerate(v):
-            if not url or not url.strip():
-                raise ValueError(f"URL at index {i} cannot be empty")
-            url = url.strip()
-            if "://" not in url:
-                url = "https://" + url
-            if not url.startswith(("http://", "https://")):
-                raise ValueError(
-                    f"URL at index {i} must start with http:// or https://"
+    def _normalize_urls(cls, v):
+        """Accept both plain strings and {url, force_js_render} objects."""
+        if not isinstance(v, list):
+            raise ValueError("urls must be a list")
+        out: list[dict] = []
+        for i, item in enumerate(v):
+            if isinstance(item, str):
+                out.append({"url": _normalize_url_str(item)})
+            elif isinstance(item, dict):
+                if "url" not in item:
+                    raise ValueError(f"URL object at index {i} missing 'url' field")
+                normalized = dict(item)
+                normalized["url"] = _normalize_url_str(item["url"])
+                out.append(normalized)
+            elif isinstance(item, UrlSpec):
+                out.append(
+                    {
+                        "url": _normalize_url_str(item.url),
+                        "force_js_render": item.force_js_render,
+                    }
                 )
-            if len(url) > 2048:
-                raise ValueError(f"URL at index {i} too long (max 2048 characters)")
-            v[i] = url
-        return v
+            else:
+                raise ValueError(
+                    f"URL at index {i} must be a string or an object"
+                )
+        return out
 
     prompt: str = Field(
         ...,
@@ -318,6 +378,16 @@ class ExtractRequest(BaseModel):
     run_async: bool = Field(
         default=False,
         description="If True, run as background task. Use GET /api/v1/extract/{task_id} to poll.",
+    )
+    allow_domains: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Per-request domain allowlist (empty = allow all). Merged with global DOMAIN_ALLOWLIST.",
+    )
+    block_domains: list[str] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Per-request domain blocklist. Merged with global DOMAIN_BLOCKLIST. Block wins over allow.",
     )
 
 
@@ -351,3 +421,27 @@ class ExtractTaskStatusResponse(BaseModel):
     failed_urls: int | None = None
     extract_mode: str | None = None
     error: str | None = None
+
+
+# ── Persistent History ─────────────────────────────────────
+
+
+class HistoryEntry(BaseModel):
+    """A single persisted history record."""
+
+    id: str
+    kind: str  # "research" | "crawl" | "map" | "extract"
+    query_or_url: str
+    params: dict | None = None
+    status: str  # "done" | "error"
+    result: dict | list | str | None = None
+    result_size: int = 0
+    error: str | None = None
+    created_at: str | None = None
+
+
+class HistoryListResponse(BaseModel):
+    """API response for listing history entries."""
+
+    total: int
+    entries: list[HistoryEntry]

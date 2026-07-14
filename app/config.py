@@ -30,6 +30,10 @@ class Settings:
     # --- Scraping ---
     min_content_length: int = int(os.getenv("MIN_CONTENT_LENGTH", "200"))
 
+    # --- PDF Scraping ---
+    pdf_enabled: bool = os.getenv("PDF_ENABLED", "true").lower() in ("1", "true", "yes")
+    pdf_max_pages: int = int(os.getenv("PDF_MAX_PAGES", "50"))
+
     # --- Observability ---
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     log_format: str = os.getenv("LOG_FORMAT", "json")  # "json" or "console"
@@ -66,6 +70,19 @@ class Settings:
     extract_temperature: float = float(os.getenv("EXTRACT_TEMPERATURE", "0.1"))
     extract_retries: int = int(os.getenv("EXTRACT_RETRIES", "1"))
 
+    # --- Domain Filtering ---
+    # Comma-separated global allow/block lists (empty allowlist = allow all).
+    domain_allowlist: set[str] = {
+        d.strip().lower()
+        for d in os.getenv("DOMAIN_ALLOWLIST", "").split(",")
+        if d.strip()
+    }
+    domain_blocklist: set[str] = {
+        d.strip().lower()
+        for d in os.getenv("DOMAIN_BLOCKLIST", "").split(",")
+        if d.strip()
+    }
+
     # --- Security ---
     chiper_api_key: str = os.getenv("CHIPER_API_KEY", "")
     chiper_cors_origins: str = os.getenv(
@@ -83,6 +100,20 @@ class Settings:
     research_total_timeout: float = float(
         os.getenv("RESEARCH_TOTAL_TIMEOUT", "300.0")
     )  # 5 min
+
+    # --- Persistent History ---
+    history_enabled: bool = os.getenv("HISTORY_ENABLED", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    database_url: str = os.getenv(
+        "DATABASE_URL", "sqlite+aiosqlite:///./chiper_history.db"
+    )
+    history_retention_days: int = int(os.getenv("HISTORY_RETENTION_DAYS", "30"))
+    history_store_full_content: bool = os.getenv(
+        "HISTORY_STORE_FULL_CONTENT", "false"
+    ).lower() in ("1", "true", "yes")
 
 
 # Singleton instance

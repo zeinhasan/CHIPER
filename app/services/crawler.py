@@ -30,6 +30,7 @@ from app.config import settings
 from app.services.scraper import fetch_and_extract
 from app.utils.helpers import get_logger
 from app.utils.links import extract_internal_links, normalize_url
+from app.utils.security import is_safe_url
 
 logger = get_logger(__name__)
 
@@ -180,6 +181,14 @@ async def crawl(
                 if child_norm in visited:
                     continue
                 if page["depth"] + 1 > max_depth:
+                    continue
+                # SSRF guard: a same-domain link can still resolve to an
+                # internal IP (DNS rebinding). Validate before enqueueing.
+                if not is_safe_url(child_norm):
+                    logger.warning(
+                        "Skipped internal/blocked child URL (SSRF)",
+                        extra={"url": child_norm},
+                    )
                     continue
 
                 visited.add(child_norm)

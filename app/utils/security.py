@@ -56,15 +56,18 @@ _BLOCKED_HOSTS: frozenset[str] = frozenset(
 )
 
 
-def _resolve_ip(hostname: str) -> str | None:
-    """Resolve a hostname to its IPv4 address.  Returns None on failure."""
+def _resolve_ips(hostname: str) -> list[str]:
+    """Resolve a hostname to all its IPv4 and IPv6 addresses.
+
+    Uses ``AF_UNSPEC`` so a host that only publishes an AAAA record
+    (IPv6) is still checked — otherwise an IPv6-only host pointing at
+    ``::1`` or a private ULA would bypass the SSRF gate.
+    """
     try:
-        info = socket.getaddrinfo(hostname, None, socket.AF_INET)
-        if info:
-            return info[0][4][0]
+        info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC)
+        return [entry[4][0] for entry in info]
     except (socket.gaierror, OSError):
-        pass
-    return None
+        return []
 
 
 def is_private_ip(hostname: str) -> bool:
@@ -90,22 +93,25 @@ def is_private_ip(hostname: str) -> bool:
     except ValueError:
         pass  # Not a literal IP, need DNS resolution
 
-    # ── DNS resolution check ──────────────────────────────────────
-    ip_str = _resolve_ip(hostname)
-    if ip_str is None:
+    # ── DNS resolution check (IPv4 + IPv6) ────────────────────────
+    ips = _resolve_ips(hostname)
+    if not ips:
         logger.debug("Cannot resolve hostname for SSRF check", extra={"host": hostname})
         return False  # Can't resolve, let the request proceed (it'll fail anyway)
 
-    try:
-        addr = ipaddress.ip_address(ip_str)
+    for ip_str in ips:
+        # IPv6 scoped addresses (fe80::1%eth0) — drop the zone id.
+        ip_str = ip_str.split("%", 1)[0]
+        try:
+            addr = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
         if any(addr in net for net in _BLOCKED_NETWORKS):
             logger.warning(
                 "Blocked internal IP via DNS",
                 extra={"hostname": hostname, "resolved_ip": ip_str},
             )
             return True
-    except ValueError:
-        pass
 
     return False
 
@@ -127,10 +133,20 @@ def validate_url_safe(url: str) -> str | None:
         logger.warning("Blocked non-HTTP scheme", extra={"url": url[:200]})
         return None
 
-    # ── Hostname/IP check ────────────────────────────────────────
+    # ── Hostname/IP check ───────────────────────────────
     hostname = parsed.hostname or ""
     if is_private_ip(hostname):
         logger.warning("Blocked internal URL (SSRF)", extra={"url": url[:200]})
         return None
 
     return url
+
+
+def is_safe_url(url: str) -> bool:
+    """Boolean SSRF gate for internally-derived URLs.
+
+    Same checks as :func:`validate_url_safe` but returns a bool, for use
+    on URLs discovered mid-flight (crawl children, post-redirect targets,
+    sitemap entries) where a raise/return-None distinction is unneeded.
+    """
+    return validate_url_safe(url) is not None

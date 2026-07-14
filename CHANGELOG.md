@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.4.2] — 2026-07-14
+
+### Security
+- **SSRF via Redirect / Crawl Child URL / Sitemap (NB-1)** — SSRF was previously validated only once on the seed URL. Now every internally-derived URL is re-checked: crawl child URLs are validated before enqueueing (guards against same-domain links resolving to private IPs via DNS rebinding), post-redirect targets in discovery are re-validated (`follow_redirects=True` could land on `127.0.0.1`/`169.254.169.254`), and sitemap/sitemap-index fetches validate both the target and the redirected URL. New `is_safe_url()` helper centralizes the gate. (`security.py`, `crawler.py`, `discovery.py`, `sitemap.py`)
+- **IPv6 SSRF Bypass (NB-6)** — DNS resolution in the SSRF gate was IPv4-only (`AF_INET`), so an IPv6-only host pointing at `::1` or a private ULA bypassed all checks. Resolution now uses `AF_UNSPEC` and validates every returned IPv4/IPv6 address against the blocklist (IPv6 zone-ids stripped). (`security.py`)
+- **`/research` Endpoint Missing SSRF Check (NB-4)** — Unlike crawl/map/extract, the research pipeline did not validate URLs before scraping (Tier-2 Playwright follows redirects anywhere). SearXNG result URLs are now filtered through `validate_url_safe()` in both sync and async modes. (`routes.py`)
+- **Non-Constant-Time API Key Comparison (NB-5)** — `ApiKeyMiddleware` now uses `secrets.compare_digest()` instead of `!=`, eliminating a timing side-channel. (`auth.py`)
+- **Body-Size Limit Bypass (NB-7)** — The `SCRAPE_MAX_BODY_MB` cap was only enforced via the `Content-Length` header, so chunked/streaming responses without that header could be fully read into memory. Both `_fetch_static()` and `_fetch_and_extract_links()` now stream via `aiter_bytes()` and abort once the accumulated byte count exceeds the cap. (`scraper.py`, `discovery.py`)
+
+### Fixed
+- **Inflight Task Limit Race Condition (NB-2)** — The `max_inflight_tasks` check-then-create in `TaskStore` was not atomic (TOCTOU), allowing concurrent background tasks to exceed the limit. Wrapped in a `threading.Lock`. (`task_store.py`)
+- **Background Tasks Without Timeout / Unreferenced (NB-3)** — Async-mode background workers ran the pipeline without any timeout (sync mode had one), and `asyncio.create_task(...)` results were not retained (risk of mid-flight GC). All background workers are now wrapped with `asyncio.wait_for(...)`, and a `_spawn_background()` helper keeps strong references until completion. (`routes.py`)
+
+### Added
+- `EXTRACT_TOTAL_TIMEOUT` env var — total timeout for extraction (sync + async), default `300s`. (`config.py`)
+- `RESEARCH_TOTAL_TIMEOUT` env var — total timeout for the async research scraping phase, default `300s`. (`config.py`)
+
+---
+
 ## [1.4.1] — 2026-07-02
 
 ### Security

@@ -149,20 +149,35 @@ async def _fetch_static(
 
     for attempt in range(1, STATIC_RETRIES + 1):
         try:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            # ── Body size check ────────────────────────────────
-            content_length = resp.headers.get("content-length")
-            if content_length:
-                try:
-                    if int(content_length) > max_body:
+            # Stream so we can enforce the byte cap even when the server
+            # omits Content-Length (chunked/streaming responses).
+            async with client.stream("GET", url, headers=headers) as resp:
+                resp.raise_for_status()
+
+                declared = resp.headers.get("content-length")
+                if declared:
+                    try:
+                        if int(declared) > max_body:
+                            return (
+                                None,
+                                f"Response too large ({declared} bytes > {max_body} max)",
+                            )
+                    except ValueError:
+                        pass  # Invalid header, fall through to streamed check
+
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > max_body:
                         return (
                             None,
-                            f"Response too large ({content_length} bytes > {max_body} max)",
+                            f"Response too large (>{max_body} bytes)",
                         )
-                except ValueError:
-                    pass  # Invalid header, proceed
-            return resp.text, None
+                    chunks.append(chunk)
+
+                body = b"".join(chunks)
+                return body.decode(resp.encoding or "utf-8", errors="replace"), None
         except httpx.HTTPStatusError as exc:
             if 400 <= exc.response.status_code < 500:
                 return None, f"HTTP {exc.response.status_code}"

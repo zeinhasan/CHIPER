@@ -9,6 +9,8 @@ which is suitable for development or when running behind a reverse proxy
 that handles auth.
 """
 
+import secrets
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -49,7 +51,8 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
                 },
             )
 
-        if client_key != settings.chiper_api_key:
+        # Constant-time comparison to avoid leaking the key via timing.
+        if not secrets.compare_digest(client_key, settings.chiper_api_key):
             return JSONResponse(
                 status_code=403,
                 content={"detail": "Invalid API key."},

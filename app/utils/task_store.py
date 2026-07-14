@@ -6,6 +6,7 @@ Tasks auto-expire after TTL seconds.
 Supports optional max-inflight-task limiting to prevent memory exhaustion.
 """
 
+import threading
 import time
 import uuid
 from typing import Any
@@ -25,6 +26,9 @@ class TaskStore:
         self._last_cleanup: float = 0.0
         self._cleanup_interval: float = 60.0  # seconds between periodic cleanups
         self._cleanup_threshold: int = 100  # force cleanup if tasks exceed this
+        # Guards the check-then-create in create() against interleaving
+        # background tasks (TOCTOU on the inflight limit).
+        self._lock = threading.Lock()
 
     @property
     def inflight(self) -> int:
@@ -42,27 +46,28 @@ class TaskStore:
 
         Raises ``RuntimeError`` when the max-inflight limit has been reached.
         """
-        # ── Enforce concurrency limit ───────────────────────────
-        if self.max_inflight > 0 and self.inflight >= self.max_inflight:
-            logger.warning(
-                "Task rejected — max inflight reached",
-                extra={
-                    "inflight": self.inflight,
-                    "max": self.max_inflight,
-                },
-            )
-            raise RuntimeError(
-                f"Too many concurrent tasks ({self.inflight}/{self.max_inflight}). "
-                "Please try again later."
-            )
+        # ── Enforce concurrency limit (atomic check-then-create) ────
+        with self._lock:
+            if self.max_inflight > 0 and self.inflight >= self.max_inflight:
+                logger.warning(
+                    "Task rejected — max inflight reached",
+                    extra={
+                        "inflight": self.inflight,
+                        "max": self.max_inflight,
+                    },
+                )
+                raise RuntimeError(
+                    f"Too many concurrent tasks ({self.inflight}/{self.max_inflight}). "
+                    "Please try again later."
+                )
 
-        task_id = str(uuid.uuid4())
-        self._tasks[task_id] = {
-            "status": "processing",
-            "result": None,
-            "query": query,
-            "created_at": time.monotonic(),
-        }
+            task_id = str(uuid.uuid4())
+            self._tasks[task_id] = {
+                "status": "processing",
+                "result": None,
+                "query": query,
+                "created_at": time.monotonic(),
+            }
         self._cleanup_if_needed()
         return task_id
 

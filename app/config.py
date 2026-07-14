@@ -77,6 +77,12 @@ class Settings:
         os.getenv("CRAWL_TOTAL_TIMEOUT", "300.0")
     )  # 5 min
     map_total_timeout: float = float(os.getenv("MAP_TOTAL_TIMEOUT", "120.0"))  # 2 min
+    extract_total_timeout: float = float(
+        os.getenv("EXTRACT_TOTAL_TIMEOUT", "300.0")
+    )  # 5 min
+    research_total_timeout: float = float(
+        os.getenv("RESEARCH_TOTAL_TIMEOUT", "300.0")
+    )  # 5 min
 
 
 # Singleton instance

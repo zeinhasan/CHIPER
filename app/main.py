@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
 
     # --- Startup ---
     setup_logging()
-    logger.info("CHIPER v1.4.1 starting up...")
+    logger.info("CHIPER v1.4.2 starting up...")
 
     # Shared httpx client (connection pool reuse)
     app.state.http_client = httpx.AsyncClient(
@@ -111,7 +111,7 @@ app = FastAPI(
         "Middleware API that bridges AI agents with SearXNG for web research "
         "and content extraction, with optional AI summarization via DeepSeek."
     ),
-    version="1.4.1",
+    version="1.4.2",
     lifespan=lifespan,
 )
 
@@ -154,7 +154,7 @@ app.include_router(router)
 @app.get("/health", tags=["system"])
 async def health_check() -> dict:
     """Simple health-check endpoint."""
-    return {"status": "ok", "version": "1.4.1"}
+    return {"status": "ok", "version": "1.4.2"}
 
 
 # --- Direct run (development) ---

@@ -59,6 +59,19 @@ def _create_task_safe(query: str | None = None) -> str:
         raise HTTPException(status_code=429, detail=_ERR_TASK_LIMIT)
 
 
+# Strong references to fire-and-forget background tasks. Without this the
+# event loop only keeps a weak reference and the task may be garbage-
+# collected mid-flight. Tasks remove themselves on completion.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> None:
+    """Schedule *coro* as a tracked background task."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 # Domains that are video/image/media platforms and not scrapable for text research.
 # These are filtered out before scraping to avoid wasting resources.
 BLOCKED_DOMAINS: set[str] = {
@@ -132,7 +145,7 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
             "Starting background full-research pipeline",
             extra={"task_id": task_id, "query": payload.query},
         )
-        asyncio.create_task(
+        _spawn_background(
             _run_full_research(
                 task_id=task_id,
                 payload=payload,
@@ -188,11 +201,14 @@ async def research(request: Request, payload: ResearchRequest) -> ResearchRespon
 
     urls = [r["url"] for r in search_results if r.get("url")]
 
-    # Filter out video/media domains that can't be scraped for text
-    filtered_urls = [u for u in urls if not _is_blocked_domain(u)]
+    # Filter out video/media domains that can't be scraped for text,
+    # and drop URLs that resolve to internal/private addresses (SSRF).
+    filtered_urls = [
+        u for u in urls if not _is_blocked_domain(u) and validate_url_safe(u)
+    ]
     if len(filtered_urls) < len(urls):
         logger.info(
-            "Filtered out blocked domains",
+            "Filtered out blocked/unsafe domains",
             extra={"before": len(urls), "after": len(filtered_urls)},
         )
 
@@ -315,11 +331,13 @@ async def _run_full_research(
 
         urls = [r["url"] for r in search_results if r.get("url")]
 
-        # Filter out video/media domains that can't be scraped for text
-        filtered_urls = [u for u in urls if not _is_blocked_domain(u)]
+        # Filter out video/media domains + SSRF-unsafe URLs
+        filtered_urls = [
+            u for u in urls if not _is_blocked_domain(u) and validate_url_safe(u)
+        ]
         if len(filtered_urls) < len(urls):
             logger.info(
-                "Filtered out blocked domains (background)",
+                "Filtered out blocked/unsafe domains (background)",
                 extra={"before": len(urls), "after": len(filtered_urls)},
             )
 
@@ -328,13 +346,16 @@ async def _run_full_research(
             extra={"query": payload.query, "url_count": len(filtered_urls)},
         )
 
-        # ── Step 2: Two-Tier Scraping ─────────────────────────────
-        scrape_results = await scraper.scrape_urls(
-            urls=filtered_urls,
-            browsers=browsers,
-            client=http_client,
-            force_js_render=payload.force_js_render,
-            max_concurrent_playwright=3,
+        # ── Step 2: Two-Tier Scraping (bounded) ───────────────────
+        scrape_results = await asyncio.wait_for(
+            scraper.scrape_urls(
+                urls=filtered_urls,
+                browsers=browsers,
+                client=http_client,
+                force_js_render=payload.force_js_render,
+                max_concurrent_playwright=3,
+            ),
+            timeout=settings.research_total_timeout,
         )
 
         search_by_url = {r["url"]: r for r in search_results}
@@ -385,6 +406,12 @@ async def _run_full_research(
             },
         )
 
+    except asyncio.TimeoutError:
+        task_store.fail(task_id, _ERR_INTERNAL)
+        logger.warning(
+            "Background full-research timed out",
+            extra={"task_id": task_id, "timeout": settings.research_total_timeout},
+        )
     except Exception as exc:
         task_store.fail(task_id, _ERR_INTERNAL)
         logger.error(
@@ -485,7 +512,7 @@ async def crawl_endpoint(request: Request, payload: CrawlRequest) -> CrawlRespon
         logger.info(
             "Starting background crawl", extra={"task_id": task_id, "url": payload.url}
         )
-        asyncio.create_task(
+        _spawn_background(
             _run_crawl_background(
                 task_id=task_id,
                 payload=payload,
@@ -579,15 +606,18 @@ async def _run_crawl_background(
 ) -> None:
     """Background task: execute full crawl pipeline and store result in task_store."""
     try:
-        crawl_results = await crawler.crawl(
-            seed_url=payload.url,
-            max_depth=payload.max_depth,
-            max_pages=payload.max_pages,
-            include_paths=payload.include_paths,
-            exclude_paths=payload.exclude_paths,
-            force_js_render=payload.force_js_render,
-            http_client=http_client,
-            browsers=browsers,
+        crawl_results = await asyncio.wait_for(
+            crawler.crawl(
+                seed_url=payload.url,
+                max_depth=payload.max_depth,
+                max_pages=payload.max_pages,
+                include_paths=payload.include_paths,
+                exclude_paths=payload.exclude_paths,
+                force_js_render=payload.force_js_render,
+                http_client=http_client,
+                browsers=browsers,
+            ),
+            timeout=settings.crawl_total_timeout,
         )
 
         ai_summary: str | None = None
@@ -631,6 +661,12 @@ async def _run_crawl_background(
             extra={"task_id": task_id, "total_pages": len(pages)},
         )
 
+    except asyncio.TimeoutError:
+        task_store.fail(task_id, _ERR_INTERNAL)
+        logger.warning(
+            "Background crawl timed out",
+            extra={"task_id": task_id, "timeout": settings.crawl_total_timeout},
+        )
     except Exception as exc:
         task_store.fail(task_id, _ERR_INTERNAL)
         logger.error(
@@ -717,7 +753,7 @@ async def map_endpoint(request: Request, payload: MapRequest) -> MapResponse:
             "Starting background map discovery",
             extra={"task_id": task_id, "url": payload.url},
         )
-        asyncio.create_task(
+        _spawn_background(
             _run_map_background(
                 task_id=task_id,
                 payload=payload,
@@ -787,16 +823,19 @@ async def _run_map_background(
 ) -> None:
     """Background task: execute URL discovery and store result in task_store."""
     try:
-        result = await discovery.run_discovery(
-            url=payload.url,
-            discovery_method=payload.discovery_method,
-            max_urls=payload.max_urls,
-            max_depth=payload.max_depth,
-            include_paths=payload.include_paths,
-            exclude_paths=payload.exclude_paths,
-            include_subdomains=payload.include_subdomains,
-            ignore_query_params=payload.ignore_query_params,
-            client=http_client,
+        result = await asyncio.wait_for(
+            discovery.run_discovery(
+                url=payload.url,
+                discovery_method=payload.discovery_method,
+                max_urls=payload.max_urls,
+                max_depth=payload.max_depth,
+                include_paths=payload.include_paths,
+                exclude_paths=payload.exclude_paths,
+                include_subdomains=payload.include_subdomains,
+                ignore_query_params=payload.ignore_query_params,
+                client=http_client,
+            ),
+            timeout=settings.map_total_timeout,
         )
 
         task_store.complete(
@@ -817,6 +856,12 @@ async def _run_map_background(
             extra={"task_id": task_id, "total_urls": len(result["urls"])},
         )
 
+    except asyncio.TimeoutError:
+        task_store.fail(task_id, _ERR_INTERNAL)
+        logger.warning(
+            "Background map discovery timed out",
+            extra={"task_id": task_id, "timeout": settings.map_total_timeout},
+        )
     except Exception as exc:
         task_store.fail(task_id, _ERR_INTERNAL)
         logger.error(
@@ -933,7 +978,7 @@ async def extract_endpoint(
             "Starting background extraction",
             extra={"task_id": task_id, "url_count": len(payload.urls)},
         )
-        asyncio.create_task(
+        _spawn_background(
             _run_extract_background(
                 task_id=task_id,
                 payload=payload,
@@ -954,14 +999,26 @@ async def extract_endpoint(
     browsers = request.app.state.playwright_browsers
 
     try:
-        data_list, failed = await extractor.run_extraction(
-            urls=payload.urls,
-            prompt=payload.prompt,
-            schema=payload.json_schema,
-            extract_mode=payload.extract_mode,
-            force_js_render=payload.force_js_render,
-            http_client=http_client,
-            browsers=browsers,
+        data_list, failed = await asyncio.wait_for(
+            extractor.run_extraction(
+                urls=payload.urls,
+                prompt=payload.prompt,
+                schema=payload.json_schema,
+                extract_mode=payload.extract_mode,
+                force_js_render=payload.force_js_render,
+                http_client=http_client,
+                browsers=browsers,
+            ),
+            timeout=settings.extract_total_timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Extraction timed out",
+            extra={"timeout": settings.extract_total_timeout},
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=f"Extraction timed out after {settings.extract_total_timeout:.0f}s",
         )
     except Exception as exc:
         logger.error("Extraction failed", extra={"error": str(exc)})
@@ -984,14 +1041,17 @@ async def _run_extract_background(
 ) -> None:
     """Background task: execute extraction pipeline and store result in task_store."""
     try:
-        data_list, failed = await extractor.run_extraction(
-            urls=payload.urls,
-            prompt=payload.prompt,
-            schema=payload.json_schema,
-            extract_mode=payload.extract_mode,
-            force_js_render=payload.force_js_render,
-            http_client=http_client,
-            browsers=browsers,
+        data_list, failed = await asyncio.wait_for(
+            extractor.run_extraction(
+                urls=payload.urls,
+                prompt=payload.prompt,
+                schema=payload.json_schema,
+                extract_mode=payload.extract_mode,
+                force_js_render=payload.force_js_render,
+                http_client=http_client,
+                browsers=browsers,
+            ),
+            timeout=settings.extract_total_timeout,
         )
 
         result_data = [
@@ -1019,6 +1079,12 @@ async def _run_extract_background(
             },
         )
 
+    except asyncio.TimeoutError:
+        task_store.fail(task_id, _ERR_INTERNAL)
+        logger.warning(
+            "Background extraction timed out",
+            extra={"task_id": task_id, "timeout": settings.extract_total_timeout},
+        )
     except Exception as exc:
         task_store.fail(task_id, _ERR_INTERNAL)
         logger.error(

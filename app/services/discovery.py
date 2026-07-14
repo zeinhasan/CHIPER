@@ -27,6 +27,7 @@ from app.utils.links import (
     extract_internal_links,
     normalize_url,
 )
+from app.utils.security import is_safe_url
 from app.utils.sitemap import find_sitemap_url, parse_sitemap
 
 logger = get_logger(__name__)
@@ -57,27 +58,43 @@ async def _fetch_and_extract_links(
     resolved_url = url  # fallback
     max_body = settings.scrape_max_body_mb * 1024 * 1024
     try:
-        resp = await client.get(url, follow_redirects=True)
-        resp.raise_for_status()
-        resolved_url = str(resp.url)
-        # ── Body size check ──────────────────────────────────────
-        content_length = resp.headers.get("content-length")
-        if content_length:
-            try:
-                if int(content_length) > max_body:
-                    return (
-                        [],
-                        f"Response too large ({content_length} bytes)",
-                        resolved_url,
-                    )
-            except ValueError:
-                pass
+        async with client.stream("GET", url, follow_redirects=True) as resp:
+            resp.raise_for_status()
+            resolved_url = str(resp.url)
+            # ── SSRF re-check on post-redirect URL ────────────────
+            # follow_redirects=True can land on an internal host even when
+            # the original URL was safe. Reject before reading the body.
+            if not is_safe_url(resolved_url):
+                return [], "Redirect to internal/blocked address", url
+
+            declared = resp.headers.get("content-length")
+            if declared:
+                try:
+                    if int(declared) > max_body:
+                        return (
+                            [],
+                            f"Response too large ({declared} bytes)",
+                            resolved_url,
+                        )
+                except ValueError:
+                    pass
+
+            # ── Streamed body-size enforcement (chunked responses) ───
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if total > max_body:
+                    return [], f"Response too large (>{max_body} bytes)", resolved_url
+                chunks.append(chunk)
+            html = b"".join(chunks).decode(
+                resp.encoding or "utf-8", errors="replace"
+            )
     except httpx.HTTPStatusError as exc:
         return [], f"HTTP {exc.response.status_code}", resolved_url
     except Exception as exc:
         return [], str(exc), resolved_url
 
-    html = resp.text
     if not html:
         return [], "Empty response body", resolved_url
 

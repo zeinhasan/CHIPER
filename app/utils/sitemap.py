@@ -23,7 +23,7 @@ import httpx
 from app.config import settings
 from app.utils.helpers import get_logger
 from app.utils.links import _is_internal, _matches_filters, normalize_url
-from app.utils.security import is_private_ip
+from app.utils.security import is_private_ip, is_safe_url
 
 logger = get_logger(__name__)
 
@@ -252,9 +252,22 @@ async def _parse_sitemap_index(
         )
         return []
 
+    # ── SSRF guard on the (possibly redirected) fetch target ────────
+    if not is_safe_url(index_url):
+        logger.warning(
+            "Sitemap index URL blocked (SSRF)", extra={"index_url": index_url}
+        )
+        return []
+
     # ── Fetch index ─────────────────────────────────────────────────
     try:
         resp = await client.get(index_url, follow_redirects=True)
+        if not is_safe_url(str(resp.url)):
+            logger.warning(
+                "Sitemap index redirected to internal/blocked address",
+                extra={"index_url": index_url, "resolved": str(resp.url)},
+            )
+            return []
         if resp.status_code != 200:
             logger.warning(
                 "Sitemap index fetch failed",
@@ -385,8 +398,19 @@ async def parse_sitemap(
     """
     start = time.monotonic()
 
+    # ── SSRF guard on the (possibly redirected) fetch target ────────
+    if not is_safe_url(sitemap_url):
+        logger.warning("Sitemap URL blocked (SSRF)", extra={"sitemap_url": sitemap_url})
+        return []
+
     try:
         resp = await client.get(sitemap_url, follow_redirects=True)
+        if not is_safe_url(str(resp.url)):
+            logger.warning(
+                "Sitemap redirected to internal/blocked address",
+                extra={"sitemap_url": sitemap_url, "resolved": str(resp.url)},
+            )
+            return []
         if resp.status_code != 200:
             logger.warning(
                 "Sitemap fetch failed",

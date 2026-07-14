@@ -139,8 +139,19 @@ CHIPER/
 │   └── settings.yml             # SearXNG configuration
 ├── Dockerfile                   # CHIPER image build
 ├── docker-compose.yml           # All-in-one: DoH proxy + SearXNG + CHIPER
-├── tests/
-│   └── test_domain_filter.py    # Assert-based self-check for domain filtering
+├── tests/                       # pytest suite (unit tests for all features)
+│   ├── conftest.py              # path setup + async runner fixture
+│   ├── test_domain_filter.py    # domain allowlist/blocklist
+│   ├── test_security.py         # SSRF prevention (IPv4/IPv6, schemes, hosts)
+│   ├── test_links.py            # URL normalization + internal link extraction
+│   ├── test_sitemap.py          # sitemap XML parsing helpers
+│   ├── test_circuit_breaker.py  # circuit breaker state machine
+│   ├── test_task_store.py       # task store + inflight limit
+│   ├── test_schemas.py          # request validation + per-page config
+│   ├── test_auth.py             # API key middleware
+│   ├── test_pdf.py              # PDF detection + extraction
+│   ├── test_summarizer.py       # summary prompt sanitization
+│   └── test_history.py          # persistent history CRUD
 ├── requirements.txt             # Python dependencies
 ├── IMPROVEMENT.md               # Improvement roadmap
 ├── .env.example                 # Environment variables template
@@ -610,6 +621,20 @@ Every completed request is recorded to a database (SQLite by default, PostgreSQL
 - `GET /api/v1/history/{id}` — fetch a single entry.
 
 `kind` is one of `research` | `crawl` | `map` | `extract`.
+
+---
+
+## 🧪 Running Tests
+
+```bash
+# Install dev + runtime deps, then run the suite
+pip install -r requirements.txt pytest
+pytest
+```
+
+Tests are plain `pytest` (no network, no live browser). A few files auto-skip if
+their optional deps are absent (e.g. `pymupdf`, `aiosqlite`), so the suite runs
+both locally and inside the Docker image.
 
 ---
 
